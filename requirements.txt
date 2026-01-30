@@ -1,5 +1,2 @@
-uvicorn
 fastapi
 pandas
-pyirt
-python_multipart
