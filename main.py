@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from typing import List, Dict
 import pandas as pd
 import io
-
+from pyirt import irt
 
 # ---------- app ----------
 app = FastAPI(title="IRT 2PL Analysis Service")
