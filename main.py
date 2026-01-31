@@ -331,7 +331,7 @@ def build_item_insights(df, item_columns, corr_threshold=0.6):
                     },
                     "actions": [
                         "Consider replacing one item if the effect is not intended.",
-                        ""
+                        "This is also highly likely to be a misinterpretation when the number of attempts is small (<300)."
                     ]
                 })
     return insights
