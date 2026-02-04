@@ -1,13 +1,11 @@
-# Use a Rocker image with basic R tools
-FROM rocker/r-ver:4.3.1
+# Use official R image
+FROM r-base:latest
 
-# Install system dependencies for R packages
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
     libcurl4-openssl-dev \
     libssl-dev \
     libxml2-dev \
-    libgit2-dev \
-    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Install R packages
@@ -17,8 +15,8 @@ RUN R -e "install.packages(c('plumber','jsonlite','TAM'), repos='https://cloud.r
 WORKDIR /app
 COPY . /app
 
-# Expose Render port
+# Expose the port Render will use
 EXPOSE 8080
 
-# Start API using plumber.R
+# Start the API
 CMD ["R", "-e", "source('plumber.R')"]

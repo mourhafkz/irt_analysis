@@ -21,6 +21,7 @@ library(TAM)
 
 #* Run IRT (2PL) from matrix payload
 #* @post /irt
+#* @post /irt/
 #* @serializer json
 function(req, res){
   # Parse JSON body
