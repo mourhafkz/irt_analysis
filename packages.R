@@ -1,0 +1,1 @@
+install.packages(c("plumber", "jsonlite", "TAM"))
