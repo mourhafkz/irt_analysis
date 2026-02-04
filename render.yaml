@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: irt-api
+    env: r
+    plan: free
+    buildCommand: Rscript packages.R
+    startCommand: Rscript plumber.R
