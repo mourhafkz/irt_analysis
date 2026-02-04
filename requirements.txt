@@ -1,5 +1,0 @@
-fastapi
-pandas
-uvicorn
-python_multipart
-pyirt
