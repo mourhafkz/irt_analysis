@@ -1,3 +1,4 @@
+install.packages(c("plumber", "jsonlite", "TAM"))
 library(plumber)
 
 # Load your API script
