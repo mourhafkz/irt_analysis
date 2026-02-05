@@ -174,6 +174,32 @@ function(req, res) {
   # Combine messages
   teacher_msg <- paste(ability_msg, reliability_msg, variance_msg, improvement_msg, sep = "\n")
   
+  
+  
+  # -----------------------------
+  # ICC computation (manual 2PL)
+  # -----------------------------
+  theta_grid <- seq(-4, 4, length = 100)
+  
+  icc_data <- vector("list", ncol(resp))
+  
+  for(i in seq_len(ncol(resp))) {
+    
+    # discrimination (a)
+    a <- mod_2pl$B[i,,1][2]
+    
+    # difficulty (b)
+    b <- mod_2pl$xsi$xsi[i]
+    
+    # ICC: P(correct)
+    P <- 1/(1+exp(-a*(theta_grid - b)))
+    
+    icc_data[[i]] <- list(
+      item = colnames(resp)[i],
+      theta = theta_grid,
+      probability = P
+    )
+  }
   # -----------------------------
   # Return JSON
   # -----------------------------
@@ -190,6 +216,7 @@ function(req, res) {
         Overall_Reliability = ifelse(is.na(overall_wle_reliability), "NA", round(overall_wle_reliability, 3))
       )
     ),
+    icc = icc_data,   # <-- NEW
     message_for_teachers = teacher_msg,
     metadata = body$metadata
   )
