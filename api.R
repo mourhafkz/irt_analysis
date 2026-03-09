@@ -10,6 +10,7 @@
 #    https://www.rplumber.io/
 #
 
+
 library(plumber)
 library(jsonlite)
 library(TAM)
@@ -120,20 +121,18 @@ function(req, res) {
   # WLE estimation
   # -----------------------------
   wle_res <- tam.wle(mod_2pl)
-  wle_scores <- as.numeric(wle_res$theta)
-  wle_se <- as.numeric(wle_res$SE)
   
-  # Overall WLE reliability
-  theta_var <- var(wle_scores, na.rm = TRUE)
-  if (is.na(theta_var) || theta_var == 0) {
-    overall_wle_reliability <- NA
-  } else {
-    overall_wle_reliability <- 1 - mean(wle_se^2, na.rm = TRUE) / theta_var
-  }
+  wle_scores <- wle_res$theta
+  wle_se <- wle_res$error
   
-  # Mean and SD of WLE
-  mean_wle <- mean(wle_scores, na.rm = TRUE)
-  sd_wle <- sd(wle_scores, na.rm = TRUE)
+  mean_wle <- mean(wle_scores,na.rm=TRUE)
+  sd_wle <- sd(wle_scores,na.rm=TRUE)
+  
+  theta_var <- var(wle_scores,na.rm=TRUE)
+  
+  overall_wle_reliability <-
+    1 - mean(wle_se^2,na.rm=TRUE)/theta_var
+  
   
   # -----------------------------
   # Rule-based teacher guidance
@@ -200,6 +199,65 @@ function(req, res) {
       probability = P
     )
   }
+  
+  
+  # -----------------------------
+  # Teacher-friendly interpretations
+  # -----------------------------
+  get_eap_text <- function(eap_rel) {
+    if (eap_rel < 0.7) {
+      paste0("The EAP reliability is the Expected A Posteriori estimation. Right now it is below 0.7, which indicates low reliability.")
+    } else if (eap_rel < 0.8) {
+      paste0("The EAP reliability is the Expected A Posteriori estimation. Right now it is close to 0.8, which indicates acceptable reliability.")
+    } else if (eap_rel < 0.9) {
+      paste0("The EAP reliability is the Expected A Posteriori estimation. Right now it is above 0.8, which indicates good reliability.")
+    } else {
+      paste0("The EAP reliability is the Expected A Posteriori estimation. Right now it is 0.9 or above, which indicates excellent reliability.")
+    }
+  }
+  
+  get_mean_text <- function(mean_wle) {
+    if (mean_wle > 1) {
+      paste0("The mean of student abilities is greater than 1, which indicates the test is too easy for students. On average, students are above the average difficulty of the test items.")
+    } else if (mean_wle < -1) {
+      paste0("The mean of student abilities is below -1, which indicates the test is too difficult for students. On average, students are below the average difficulty of the test items.")
+    } else {
+      paste0("The mean of student abilities is close to 0, which indicates the test is suitable for most students.")
+    }
+  }
+  
+  get_sd_text <- function(sd_wle) {
+    if (sd_wle < 0.5) {
+      paste0("The students’ abilities are very similar, so the test doesn’t really differentiate between them.")
+    } else if (sd_wle < 0.8) {
+      paste0("The students’ abilities show some variation, but differences are still fairly small.")
+    } else if (sd_wle < 1.3) {
+      paste0("There’s a healthy spread in student abilities, so the test differentiates well between stronger and weaker students.")
+    } else {
+      paste0("Student abilities vary a lot, indicating very large differences in performance across the group.")
+    }
+  }
+  
+  get_overall_wle_text <- function(overall_wle_reliability) {
+    if (overall_wle_reliability < 0.7) {
+      paste0("The WLE reliability is below 0.7, which indicates low reliability of the exercise.")
+    } else if (overall_wle_reliability < 0.8) {
+      paste0("WLE indicates acceptable reliability because the value is close to 0.8")
+    } else if (overall_wle_reliability < 0.9) {
+      paste0("Good reliability: WLE is close to 0.9")
+    } else {
+      paste0("This exercise has excellent reliability because it is above 0.9")
+    }
+  }
+  
+  
+  
+  eap_text     <- get_eap_text(mod_2pl$EAP.rel)
+  mean_text    <- get_mean_text(mean_wle)
+  sd_text      <- get_sd_text(sd_wle)
+  overall_text <- get_overall_wle_text(overall_wle_reliability)
+  
+  
   # -----------------------------
   # Return JSON
   # -----------------------------
@@ -209,11 +267,15 @@ function(req, res) {
     model = list(
       type = "2PL",
       package = "TAM",
-      EAP_Reliability = round(mod_2pl$EAP.rel, 3),
+      EAP_Reliability  = round(mod_2pl$EAP.rel, 3),
+      eap_text         = eap_text,
       WLE = list(
-        mean_score = round(mean_wle, 2),
-        SD_score = round(sd_wle, 2),
-        Overall_Reliability = ifelse(is.na(overall_wle_reliability), "NA", round(overall_wle_reliability, 3))
+        mean_score        = mean_wle,
+        mean_text         = mean_text,
+        SD_score          = sd_wle,
+        sd_text           = sd_text,
+        Overall_Reliability = round(overall_wle_reliability, 3),
+        overall_text      = overall_text
       )
     ),
     icc = icc_data,   # <-- NEW
