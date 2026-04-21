@@ -1,301 +1,344 @@
 #
-# This is a Plumber API. In RStudio 1.2 or newer you can run the API by
-# clicking the 'Run API' button above.
+# IRT Analysis API for DLTPT
+# 2PL model via TAM, with teacher-facing interpretations
 #
-# In RStudio 1.1 or older, see the Plumber documentation for details
-# on running the API.
-#
-# Find out more about building APIs with Plumber here:
-#
-#    https://www.rplumber.io/
-#
-
 
 library(plumber)
 library(jsonlite)
 library(TAM)
 
 
-#* @apiTitle IRT Analysis for DLTPT
-#* @apiDescription IRT Analysis for DLTPT
+# =========================================================================
+# Helpers (defined once, used by the route)
+# =========================================================================
 
-#* Run IRT (2PL) from matrix payload
+# ---- Safe JSON parsing ---------------------------------------------------
+parse_body <- function(req) {
+  tryCatch(
+    fromJSON(req$postBody),
+    error = function(e) NULL
+  )
+}
+
+# ---- Matrix -> data.frame ------------------------------------------------
+matrix_to_df <- function(matrix_obj) {
+  tryCatch({
+    rows_list <- if (is.list(matrix_obj$rows[[1]])) {
+      matrix_obj$rows
+    } else {
+      list(matrix_obj$rows)
+    }
+    mat <- do.call(rbind, rows_list)
+    df  <- as.data.frame(mat)
+    colnames(df) <- matrix_obj$columns
+    df
+  }, error = function(e) NULL)
+}
+
+# ---- Strip person/student ID column(s) regardless of position ------------
+strip_id_columns <- function(df) {
+  id_names <- c("person_id", "student_id", "id", "user_id")
+  id_idx   <- which(tolower(colnames(df)) %in% id_names)
+  if (length(id_idx) > 0) df[, -id_idx, drop = FALSE] else df
+}
+
+# ---- Fit the 2PL model ---------------------------------------------------
+fit_2pl <- function(resp) {
+  tryCatch(
+    suppressMessages(tam.mml.2pl(resp, verbose = FALSE)),
+    error = function(e) structure(list(error = e$message), class = "tam_error")
+  )
+}
+
+# ---- Response diagnostics: who got dropped and why -----------------------
+response_diagnostics <- function(resp) {
+  n_total    <- nrow(resp)
+  total      <- rowSums(resp, na.rm = TRUE)
+  n_items    <- ncol(resp)
+  perfect    <- total == n_items
+  zero       <- total == 0
+  incomplete <- rowSums(is.na(resp)) > 0
+  list(
+    n_total_attempts = n_total,
+    n_perfect_scores = sum(perfect),
+    n_zero_scores    = sum(zero),
+    n_incomplete     = sum(incomplete),
+    n_used_for_calib = sum(!(perfect | zero | incomplete))
+  )
+}
+
+# ---- Item-level flags (two tiers: broken vs. weak) -----------------------
+build_item_flags <- function(resp, mod) {
+  discrimination <- mod$B[, , 1][, 2]
+  difficulty     <- mod$xsi$xsi
+  prop_correct   <- colMeans(resp, na.rm = TRUE)
+
+  total_score    <- rowSums(resp, na.rm = TRUE)
+  item_total_cor <- sapply(
+    resp,
+    function(x) cor(x, total_score - x, use = "pairwise.complete.obs")
+  )
+
+  fit <- tam.fit(mod)$itemfit
+  outfit <- fit$Outfit
+  infit  <- fit$Infit
+
+  flags <- data.frame(
+    Item           = colnames(resp),
+    Difficulty     = round(difficulty,     3),
+    Discrimination = round(discrimination, 3),
+    PropCorrect    = round(prop_correct,   3),
+    ItemTotalCor   = round(item_total_cor, 3),
+    Infit          = round(infit,          3),
+    Outfit         = round(outfit,         3),
+    stringsAsFactors = FALSE
+  )
+
+  # Two-tier flagging
+  flags$Flag <- ""
+
+  # Severe: the item is probably broken
+  broken_mask <- flags$Discrimination < 0 | flags$ItemTotalCor < 0
+  flags$Flag[broken_mask] <- paste(flags$Flag[broken_mask], "BROKEN_negDisc")
+
+  # Weak but not broken
+  weak_disc <- flags$Discrimination >= 0 & flags$Discrimination < 0.6
+  flags$Flag[weak_disc]   <- paste(flags$Flag[weak_disc],   "WeakDisc")
+
+  flags$Flag[flags$PropCorrect > 0.95] <- paste(flags$Flag[flags$PropCorrect > 0.95], "TooEasy")
+  flags$Flag[flags$PropCorrect < 0.20] <- paste(flags$Flag[flags$PropCorrect < 0.20], "TooHard")
+
+  low_corr <- flags$ItemTotalCor < 0.30 & flags$ItemTotalCor >= 0
+  flags$Flag[low_corr] <- paste(flags$Flag[low_corr], "LowCorr")
+
+  flags$Flag[flags$Infit  > 1.3] <- paste(flags$Flag[flags$Infit  > 1.3], "InfitHigh")
+  flags$Flag[flags$Outfit > 2.0] <- paste(flags$Flag[flags$Outfit > 2.0], "OutfitHigh")
+
+  flags$Flag <- trimws(flags$Flag)
+  flags
+}
+
+# ---- Yen's Q3 (residual correlations) for local dependence ---------------
+compute_q3 <- function(mod, threshold = 0.2) {
+  q3_result <- tryCatch(
+    suppressWarnings(tam.modelfit(mod, progress = FALSE)),
+    error = function(e) NULL
+  )
+  if (is.null(q3_result) || is.null(q3_result$Q3.matr)) {
+    return(data.frame(
+      Item1 = character(0), Item2 = character(0),
+      Q3 = numeric(0), Recommendation = character(0)
+    ))
+  }
+
+  q3_mat   <- q3_result$Q3.matr
+  upper    <- which(abs(q3_mat) > threshold & upper.tri(q3_mat), arr.ind = TRUE)
+  if (nrow(upper) == 0) {
+    return(data.frame(
+      Item1 = character(0), Item2 = character(0),
+      Q3 = numeric(0), Recommendation = character(0)
+    ))
+  }
+
+  data.frame(
+    Item1          = colnames(q3_mat)[upper[, 1]],
+    Item2          = colnames(q3_mat)[upper[, 2]],
+    Q3             = round(q3_mat[upper], 3),
+    Recommendation = "Items may share construct-irrelevant variance; consider revising one.",
+    stringsAsFactors = FALSE
+  )
+}
+
+# ---- WLE summary ---------------------------------------------------------
+wle_summary <- function(mod) {
+  res    <- tam.wle(mod, progress = FALSE)
+  theta  <- res$theta
+  se     <- res$error
+  m      <- mean(theta, na.rm = TRUE)
+  s      <- sd(theta,   na.rm = TRUE)
+  v      <- var(theta,  na.rm = TRUE)
+  # Guard against pathological values
+  rel <- if (!is.na(v) && v > 0) 1 - mean(se^2, na.rm = TRUE) / v else NA_real_
+  rel <- if (!is.na(rel) && rel < 0) 0 else rel
+  list(mean = m, sd = s, reliability = rel)
+}
+
+# ---- Build ICC curves for the frontend -----------------------------------
+build_icc <- function(mod, item_names, theta_grid = seq(-4, 4, length.out = 100)) {
+  lapply(seq_along(item_names), function(i) {
+    a <- mod$B[i, , 1][2]
+    b <- mod$xsi$xsi[i]
+    P <- 1 / (1 + exp(-a * (theta_grid - b)))
+    list(
+      item        = item_names[i],
+      theta       = theta_grid,
+      probability = round(P, 4)
+    )
+  })
+}
+
+# =========================================================================
+# Teacher-facing text generators
+# =========================================================================
+
+text_eap <- function(r) {
+  if (is.na(r))           "EAP reliability could not be estimated from this sample."
+  else if (r < 0.7)       "EAP reliability is below 0.7. The test cannot reliably separate students."
+  else if (r < 0.8)       "EAP reliability is close to 0.8, indicating acceptable reliability."
+  else if (r < 0.9)       "EAP reliability is above 0.8, indicating good reliability."
+  else                    "EAP reliability is 0.9 or above, indicating excellent reliability."
+}
+
+text_wle_rel <- function(r) {
+  if (is.na(r))           "WLE reliability could not be estimated from this sample."
+  else if (r < 0.7)       "WLE reliability is below 0.7, indicating low reliability."
+  else if (r < 0.8)       "WLE reliability is close to 0.8, indicating acceptable reliability."
+  else if (r < 0.9)       "WLE reliability is above 0.8, indicating good reliability."
+  else                    "WLE reliability is 0.9 or above, indicating excellent reliability."
+}
+
+text_mean <- function(m) {
+  if (is.na(m))           "Mean student ability could not be estimated."
+  else if (m >  1)        "Mean ability is above 1: the test appears easy for this group."
+  else if (m < -1)        "Mean ability is below -1: the test appears difficult for this group."
+  else                    "Mean ability is close to 0: the test is suitable for most students."
+}
+
+text_sd <- function(s) {
+  if (is.na(s))           "Ability spread could not be estimated."
+  else if (s < 0.5)       "Abilities are very similar; the test does not differentiate students well."
+  else if (s < 0.8)       "Abilities show some variation, but differences are still small."
+  else if (s < 1.3)       "Healthy spread in abilities; the test differentiates well between students."
+  else                    "Abilities vary substantially, indicating large performance differences."
+}
+
+text_ability <- function(m) {
+  if (is.na(m))           "Cannot determine target ability level from this sample."
+  else if (m >  1)        "The exercise targets high-ability students."
+  else if (m < -0.5)      "The exercise targets low-ability students."
+  else                    "The exercise targets average-ability students."
+}
+
+text_variance <- function(s) {
+  if (!is.na(s) && s < 0.5)
+    "Consider adding items that vary more in difficulty to better distinguish students."
+  else
+    ""
+}
+
+text_improvement <- function(r) {
+  if (is.na(r) || r < 0.7) {
+    paste(
+      "To improve reliability, consider:",
+      "- Adding more discriminating items (discrimination > 0.6)",
+      "- Removing items that are too easy (> 95% correct) or too hard (< 20% correct)",
+      "- Increasing content diversity to raise score variance.",
+      sep = "\n"
+    )
+  } else ""
+}
+
+build_teacher_message <- function(mean_wle, sd_wle, wle_rel) {
+  parts <- c(
+    text_ability(mean_wle),
+    text_wle_rel(wle_rel),
+    text_variance(sd_wle),
+    text_improvement(wle_rel)
+  )
+  paste(parts[nzchar(parts)], collapse = "\n")
+}
+
+
+# =========================================================================
+# API
+# =========================================================================
+
+#* @apiTitle IRT Analysis for DLTPT
+#* @apiDescription 2PL IRT analysis, item diagnostics, and teacher-facing interpretations.
+
+#* Run 2PL IRT analysis on a response matrix
 #* @post /irt
 #* @post /irt/
 #* @serializer json
 function(req, res) {
-  
-  library(jsonlite)
-  library(TAM)
-  
-  # Parse JSON body
-  body <- tryCatch({
-    fromJSON(req$postBody)
-  }, error = function(e) {
+
+  # ---- Parse and validate ----
+  body <- parse_body(req)
+  if (is.null(body)) {
     res$status <- 400
-    return(list(error = paste("Invalid JSON:", e$message)))
-  })
-  
-  # Validate matrix
+    return(list(error = "Invalid JSON in request body."))
+  }
+
   if (is.null(body$matrix$rows) || length(body$matrix$rows) == 0) {
     res$status <- 400
-    return(list(error = "Empty matrix in payload"))
+    return(list(error = "Empty matrix in payload."))
   }
-  
-  # Convert JSON matrix to data.frame
-  df <- tryCatch({
-    rows_list <- if (is.list(body$matrix$rows[[1]])) body$matrix$rows else list(body$matrix$rows)
-    mat <- do.call(rbind, rows_list)
-    df <- as.data.frame(mat)
-    colnames(df) <- body$matrix$columns
-    df
-  }, error = function(e) {
+
+  df <- matrix_to_df(body$matrix)
+  if (is.null(df)) {
+    res$status <- 400
+    return(list(error = "Could not convert matrix to data.frame."))
+  }
+
+  resp <- strip_id_columns(df)
+
+  if (ncol(resp) < 3) {
+    res$status <- 400
+    return(list(error = "Too few items for IRT analysis (need at least 3)."))
+  }
+  if (nrow(resp) < 20) {
+    res$status <- 400
+    return(list(error = "Too few respondents for stable 2PL estimation (need at least 20)."))
+  }
+
+  # Coerce to numeric matrix (guard against character columns from JSON)
+  resp[] <- lapply(resp, function(x) as.numeric(as.character(x)))
+
+  # ---- Fit model ----
+  mod <- fit_2pl(resp)
+  if (inherits(mod, "tam_error")) {
     res$status <- 500
-    return(list(error = paste("Cannot convert matrix to data.frame:", e$message)))
-  })
-  
-  # Remove person_id if exists
-  resp <- df[, -1, drop = FALSE]
-  
-  # Run 2PL model
-  mod_2pl <- tryCatch({
-    tam.mml.2pl(resp)
-  }, error = function(e) {
-    res$status <- 500
-    return(list(error = paste("TAM 2PL model failed:", e$message)))
-  })
-  
-  
-  
-  # Core item parameters
-  discrimination <- mod_2pl$B[, , 1][,2]
-  difficulty <- mod_2pl$xsi$xsi
-  prop_correct <- colMeans(resp, na.rm = TRUE)
-  
-  # Item-total correlations
-  total_score <- rowSums(resp, na.rm = TRUE)
-  item_total_cor <- sapply(resp, function(x) cor(x, total_score, use = "pairwise.complete.obs"))
-  
-  # Outfit statistics
-  fit_stats <- tam.fit(mod_2pl)$itemfit
-  outfit <- fit_stats$Outfit
-  
-  # Assemble flags
-  flags <- data.frame(
-    Item = colnames(resp),
-    Difficulty = difficulty,
-    Discrimination = discrimination,
-    PropCorrect = prop_correct,
-    ItemTotalCor = item_total_cor,
-    Outfit = outfit,
-    stringsAsFactors = FALSE
-  )
-  
-  flags$Flag <- ""
-  flags$Flag[flags$Discrimination < 0.6] <- paste(flags$Flag[flags$Discrimination < 0.6], "LowDisc")
-  flags$Flag[flags$PropCorrect > 0.9] <- paste(flags$Flag[flags$PropCorrect > 0.9], "TooEasy")
-  flags$Flag[flags$PropCorrect < 0.2] <- paste(flags$Flag[flags$PropCorrect < 0.2], "TooHard")
-  flags$Flag[flags$ItemTotalCor < 0.3] <- paste(flags$Flag[flags$ItemTotalCor < 0.3], "LowCorr")
-  flags$Flag[flags$Outfit > 1.3] <- paste(flags$Flag[flags$Outfit > 1.3], "Misfit")
-  flags$Flag <- trimws(flags$Flag)
-  
-  # High item correlation check
-  item_cor_matrix <- cor(resp, use = "pairwise.complete.obs")
-  corr_threshold <- 0.6
-  upper_idx <- which(item_cor_matrix > corr_threshold & upper.tri(item_cor_matrix), arr.ind = TRUE)
-  
-  high_corr_df <- if (nrow(upper_idx) > 0) {
-    data.frame(
-      Item1 = colnames(item_cor_matrix)[upper_idx[,1]],
-      Item2 = colnames(item_cor_matrix)[upper_idx[,2]],
-      Correlation = item_cor_matrix[upper_idx],
-      Recommendation = "Consider dropping/replacing one for more varied exercise",
-      stringsAsFactors = FALSE
-    )
-  } else {
-    data.frame(Item1 = character(0), Item2 = character(0), Correlation = numeric(0), Recommendation = character(0))
+    return(list(error = paste("TAM 2PL model failed:", mod$error)))
   }
-  
-  
-  # -----------------------------
-  # WLE estimation
-  # -----------------------------
-  wle_res <- tam.wle(mod_2pl)
-  
-  wle_scores <- wle_res$theta
-  wle_se <- wle_res$error
-  
-  mean_wle <- mean(wle_scores,na.rm=TRUE)
-  sd_wle <- sd(wle_scores,na.rm=TRUE)
-  
-  theta_var <- var(wle_scores,na.rm=TRUE)
-  
-  overall_wle_reliability <-
-    1 - mean(wle_se^2,na.rm=TRUE)/theta_var
-  
-  
-  # -----------------------------
-  # Rule-based teacher guidance
-  # -----------------------------
-  # 1. Reliability message
-  if (is.na(overall_wle_reliability) || overall_wle_reliability < 0.7) {
-    reliability_msg <- "The test is okay for practice or formative assessment, but you cannot confidently rank students based on these results."
-    improvement_msg <- paste(
-      "To improve reliability, consider:\n",
-      "- Adding more discriminating items (discrimination > 0.6)\n",
-      "- Avoiding items that are too easy or too hard (prop correct > 0.9 or < 0.2)\n",
-      "- Increasing diversity in item content to increase score variance."
-    )
-  } else if (overall_wle_reliability < 0.8) {
-    reliability_msg <- "The test is moderately reliable; use results with some caution."
-    improvement_msg <- ""
-  } else {
-    reliability_msg <- "The test is reliable; scores can be used to identify differences in student ability."
-    improvement_msg <- ""
-  }
-  
-  # 2. Ability level
-  if (mean_wle > 1) {
-    ability_msg <- "The exercise targets high-ability students."
-  } else if (mean_wle < -0.5) {
-    ability_msg <- "The exercise targets low-ability students."
-  } else {
-    ability_msg <- "The exercise targets average-ability students."
-  }
-  
-  # 3. Variance check
-  if (!is.na(sd_wle) && sd_wle < 0.5) {
-    variance_msg <- "Consider adding items that vary more in difficulty to better distinguish students."
-  } else {
-    variance_msg <- ""
-  }
-  
-  # Combine messages
-  teacher_msg <- paste(ability_msg, reliability_msg, variance_msg, improvement_msg, sep = "\n")
-  
-  
-  
-  # -----------------------------
-  # ICC computation (manual 2PL)
-  # -----------------------------
-  theta_grid <- seq(-4, 4, length = 100)
-  
-  icc_data <- vector("list", ncol(resp))
-  
-  for(i in seq_len(ncol(resp))) {
-    
-    # discrimination (a)
-    a <- mod_2pl$B[i,,1][2]
-    
-    # difficulty (b)
-    b <- mod_2pl$xsi$xsi[i]
-    
-    # ICC: P(correct)
-    P <- 1/(1+exp(-a*(theta_grid - b)))
-    
-    icc_data[[i]] <- list(
-      item = colnames(resp)[i],
-      theta = theta_grid,
-      probability = P
-    )
-  }
-  
-  
-  # -----------------------------
-  # Teacher-friendly interpretations
-  # -----------------------------
-  get_eap_text <- function(eap_rel) {
-    if (eap_rel < 0.7) {
-      paste0("The EAP reliability is the Expected A Posteriori estimation. Right now it is below 0.7, which indicates low reliability.")
-    } else if (eap_rel < 0.8) {
-      paste0("The EAP reliability is the Expected A Posteriori estimation. Right now it is close to 0.8, which indicates acceptable reliability.")
-    } else if (eap_rel < 0.9) {
-      paste0("The EAP reliability is the Expected A Posteriori estimation. Right now it is above 0.8, which indicates good reliability.")
-    } else {
-      paste0("The EAP reliability is the Expected A Posteriori estimation. Right now it is 0.9 or above, which indicates excellent reliability.")
-    }
-  }
-  
-  get_mean_text <- function(mean_wle) {
-    if (mean_wle > 1) {
-      paste0("The mean of student abilities is greater than 1, which indicates the test is too easy for students. On average, students are above the average difficulty of the test items.")
-    } else if (mean_wle < -1) {
-      paste0("The mean of student abilities is below -1, which indicates the test is too difficult for students. On average, students are below the average difficulty of the test items.")
-    } else {
-      paste0("The mean of student abilities is close to 0, which indicates the test is suitable for most students.")
-    }
-  }
-  
-  get_sd_text <- function(sd_wle) {
-    if (sd_wle < 0.5) {
-      paste0("The students’ abilities are very similar, so the test doesn’t really differentiate between them.")
-    } else if (sd_wle < 0.8) {
-      paste0("The students’ abilities show some variation, but differences are still fairly small.")
-    } else if (sd_wle < 1.3) {
-      paste0("There’s a healthy spread in student abilities, so the test differentiates well between stronger and weaker students.")
-    } else {
-      paste0("Student abilities vary a lot, indicating very large differences in performance across the group.")
-    }
-  }
-  
-  get_overall_wle_text <- function(overall_wle_reliability) {
-    if (overall_wle_reliability < 0.7) {
-      paste0("The WLE reliability is below 0.7, which indicates low reliability of the exercise.")
-    } else if (overall_wle_reliability < 0.8) {
-      paste0("WLE indicates acceptable reliability because the value is close to 0.8")
-    } else if (overall_wle_reliability < 0.9) {
-      paste0("Good reliability: WLE is close to 0.9")
-    } else {
-      paste0("This exercise has excellent reliability because it is above 0.9")
-    }
-  }
-  
-  
-  
-  eap_text     <- get_eap_text(mod_2pl$EAP.rel)
-  mean_text    <- get_mean_text(mean_wle)
-  sd_text      <- get_sd_text(sd_wle)
-  overall_text <- get_overall_wle_text(overall_wle_reliability)
-  
-  
-  # -----------------------------
-  # Return JSON
-  # -----------------------------
+
+  # ---- Diagnostics ----
+  diag_info  <- response_diagnostics(resp)
+  item_flags <- build_item_flags(resp, mod)
+  q3_pairs   <- compute_q3(mod, threshold = 0.2)
+  wle        <- wle_summary(mod)
+  icc_data   <- build_icc(mod, colnames(resp))
+
+  eap_rel    <- round(as.numeric(mod$EAP.rel), 3)
+  wle_rel    <- if (!is.na(wle$reliability)) round(wle$reliability, 3) else NA
+
+  teacher_msg <- build_teacher_message(wle$mean, wle$sd, wle$reliability)
+
+  # ---- Response (flat, consistent snake_case) ----
   list(
-    items = flags,
-    correlations = high_corr_df,
+    items        = item_flags,
+    correlations = q3_pairs,
     model = list(
-      type = "2PL",
-      package = "TAM",
-      EAP_Reliability  = round(mod_2pl$EAP.rel, 3),
-      eap_text         = eap_text,
-      WLE = list(
-        mean_score        = mean_wle,
-        mean_text         = mean_text,
-        SD_score          = sd_wle,
-        sd_text           = sd_text,
-        Overall_Reliability = round(overall_wle_reliability, 3),
-        overall_text      = overall_text
-      )
+      type             = "2PL",
+      package          = "TAM",
+      eap_reliability  = eap_rel,
+      eap_text         = text_eap(eap_rel),
+      wle_reliability  = wle_rel,
+      wle_text         = text_wle_rel(wle_rel),
+      wle_mean         = round(wle$mean, 3),
+      wle_mean_text    = text_mean(wle$mean),
+      wle_sd           = round(wle$sd, 3),
+      wle_sd_text      = text_sd(wle$sd)
     ),
-    icc = icc_data,   # <-- NEW
+    diagnostics          = diag_info,
+    icc                  = icc_data,
     message_for_teachers = teacher_msg,
-    metadata = body$metadata
+    metadata             = body$metadata
   )
 }
 
 
-
-#* Echo back the input
+#* Health check
 #* @get /
-function(){
-  "Hello World!"
-}
-
-
-#* Echo back the input
-#* @param msg The message to echo
-#* @get /echo
-function(msg=""){
-  list(msg = paste0("The message is: '", msg, "'"))
+function() {
+  list(status = "ok", service = "DLTPT IRT", version = "1.1")
 }
