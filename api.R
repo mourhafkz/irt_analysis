@@ -79,7 +79,11 @@ na_false <- function(x) {
 # ---- Item-level flags (two tiers: broken vs. weak) -----------------------
 build_item_flags <- function(resp, mod) {
   discrimination <- mod$B[, , 1][, 2]
-  difficulty     <- mod$xsi$xsi
+  # FIX #1: TAM's 2PL is P = invlogit(a*theta - xsi), so xsi is the intercept.
+  # The classical difficulty (theta where P = 0.5) is b = xsi / a. Using xsi
+  # directly is only correct when a = 1 (Rasch); on a 2PL it is off by a factor
+  # of a per item -- worst on the high-slope items.
+  difficulty     <- mod$xsi$xsi / discrimination
   prop_correct   <- colMeans(resp, na.rm = TRUE)
 
   total_score    <- rowSums(resp, na.rm = TRUE)
@@ -118,6 +122,12 @@ build_item_flags <- function(resp, mod) {
   # Weak but not broken
   weak_disc <- na_false(flags$Discrimination >= 0 & flags$Discrimination < 0.6)
   flags$Flag[weak_disc] <- paste(flags$Flag[weak_disc], "WeakDisc")
+
+  # FIX #3: Degenerate-high discrimination. The slope ran to the estimator's
+  # edge. With small N this is a near-Guttman column, not a superb item -- it
+  # inflates information (hence reliability) and is unstable across samples.
+  over_disc <- na_false(flags$Discrimination > 3)
+  flags$Flag[over_disc] <- paste(flags$Flag[over_disc], "UnstableDisc")
 
   too_easy <- na_false(flags$PropCorrect > 0.95)
   flags$Flag[too_easy] <- paste(flags$Flag[too_easy], "TooEasy")
@@ -187,7 +197,10 @@ wle_summary <- function(mod) {
 build_icc <- function(mod, item_names, theta_grid = seq(-4, 4, length.out = 100)) {
   lapply(seq_along(item_names), function(i) {
     a <- mod$B[i, , 1][2]
-    b <- mod$xsi$xsi[i]
+    # FIX #1 (same parameterization issue as build_item_flags): the P = 0.5
+    # location is xsi / a, not xsi. Without this the curve is shifted by a
+    # factor of a -- e.g. ~5x for an item with a ~ 5.
+    b <- mod$xsi$xsi[i] / a
     P <- 1 / (1 + exp(-a * (theta_grid - b)))
     list(
       item        = item_names[i],
@@ -314,19 +327,36 @@ function(req, res) {
   # Coerce to numeric matrix (guard against character columns from JSON)
   resp[] <- lapply(resp, function(x) as.numeric(as.character(x)))
 
-  # ---- Fit model ----
-  mod <- fit_2pl(resp)
+  # ---- Diagnostics: report on the matrix AS RECEIVED ----
+  diag_info <- response_diagnostics(resp)
+
+  # FIX #2: Drop perfect / zero / incomplete BEFORE calibration.
+  # response_diagnostics only *counts* these; previously the model was still fit
+  # on the full matrix, so perfect/zero rows pulled the MML item parameters (and
+  # thus reliability) while the diagnostics claimed they were excluded. Fit on
+  # the kept rows so the model matches what n_used_for_calib reports. Uses the
+  # exact same predicate as response_diagnostics().
+  total    <- rowSums(resp, na.rm = TRUE)
+  keep_row <- !(total == 0 | total == ncol(resp) | rowSums(is.na(resp)) > 0)
+  resp_cal <- resp[keep_row, , drop = FALSE]
+
+  if (nrow(resp_cal) < 20) {
+    res$status <- 400
+    return(list(error = "Too few respondents after removing perfect/zero/incomplete scores (need at least 20)."))
+  }
+
+  # ---- Fit model on the calibration sample ----
+  mod <- fit_2pl(resp_cal)
   if (inherits(mod, "tam_error")) {
     res$status <- 500
     return(list(error = paste("TAM 2PL model failed:", mod$error)))
   }
 
-  # ---- Diagnostics ----
-  diag_info  <- response_diagnostics(resp)
-  item_flags <- build_item_flags(resp, mod)
+  # ---- Remaining diagnostics run on the calibration sample ----
+  item_flags <- build_item_flags(resp_cal, mod)
   q3_pairs   <- compute_q3(mod, threshold = 0.2)
   wle        <- wle_summary(mod)
-  icc_data   <- build_icc(mod, colnames(resp))
+  icc_data   <- build_icc(mod, colnames(resp_cal))
 
   eap_rel    <- round(as.numeric(mod$EAP.rel), 3)
   wle_rel    <- if (!is.na(wle$reliability)) round(wle$reliability, 3) else NA
