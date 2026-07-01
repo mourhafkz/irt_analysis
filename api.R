@@ -67,6 +67,15 @@ response_diagnostics <- function(resp) {
   )
 }
 
+# ---- NA-safe logical mask ------------------------------------------------
+# Undefined item statistics (e.g. a constant item's item-total correlation
+# comes back as NA) must never enter a `[<-` subscript, or R errors with
+# "NAs are not allowed in subscripted assignments". Coerce NA -> FALSE.
+na_false <- function(x) {
+  x[is.na(x)] <- FALSE
+  x
+}
+
 # ---- Item-level flags (two tiers: broken vs. weak) -----------------------
 build_item_flags <- function(resp, mod) {
   discrimination <- mod$B[, , 1][, 2]
@@ -76,10 +85,14 @@ build_item_flags <- function(resp, mod) {
   total_score    <- rowSums(resp, na.rm = TRUE)
   item_total_cor <- sapply(
     resp,
-    function(x) cor(x, total_score - x, use = "pairwise.complete.obs")
+    function(x) {
+      # A constant item (all-correct / all-wrong) has zero SD; cor() then
+      # returns NA and warns. That's expected here -- suppress the noise.
+      suppressWarnings(cor(x, total_score - x, use = "pairwise.complete.obs"))
+    }
   )
 
-  fit <- tam.fit(mod)$itemfit
+  fit    <- tam.fit(mod)$itemfit
   outfit <- fit$Outfit
   infit  <- fit$Infit
 
@@ -94,25 +107,32 @@ build_item_flags <- function(resp, mod) {
     stringsAsFactors = FALSE
   )
 
-  # Two-tier flagging
+  # Two-tier flagging. Every mask is wrapped in na_false() so items with
+  # undefined statistics don't break the subscripted assignments below.
   flags$Flag <- ""
 
   # Severe: the item is probably broken
-  broken_mask <- flags$Discrimination < 0 | flags$ItemTotalCor < 0
+  broken_mask <- na_false(flags$Discrimination < 0 | flags$ItemTotalCor < 0)
   flags$Flag[broken_mask] <- paste(flags$Flag[broken_mask], "BROKEN_negDisc")
 
   # Weak but not broken
-  weak_disc <- flags$Discrimination >= 0 & flags$Discrimination < 0.6
-  flags$Flag[weak_disc]   <- paste(flags$Flag[weak_disc],   "WeakDisc")
+  weak_disc <- na_false(flags$Discrimination >= 0 & flags$Discrimination < 0.6)
+  flags$Flag[weak_disc] <- paste(flags$Flag[weak_disc], "WeakDisc")
 
-  flags$Flag[flags$PropCorrect > 0.95] <- paste(flags$Flag[flags$PropCorrect > 0.95], "TooEasy")
-  flags$Flag[flags$PropCorrect < 0.20] <- paste(flags$Flag[flags$PropCorrect < 0.20], "TooHard")
+  too_easy <- na_false(flags$PropCorrect > 0.95)
+  flags$Flag[too_easy] <- paste(flags$Flag[too_easy], "TooEasy")
 
-  low_corr <- flags$ItemTotalCor < 0.30 & flags$ItemTotalCor >= 0
+  too_hard <- na_false(flags$PropCorrect < 0.20)
+  flags$Flag[too_hard] <- paste(flags$Flag[too_hard], "TooHard")
+
+  low_corr <- na_false(flags$ItemTotalCor < 0.30 & flags$ItemTotalCor >= 0)
   flags$Flag[low_corr] <- paste(flags$Flag[low_corr], "LowCorr")
 
-  flags$Flag[flags$Infit  > 1.3] <- paste(flags$Flag[flags$Infit  > 1.3], "InfitHigh")
-  flags$Flag[flags$Outfit > 2.0] <- paste(flags$Flag[flags$Outfit > 2.0], "OutfitHigh")
+  infit_high <- na_false(flags$Infit > 1.3)
+  flags$Flag[infit_high] <- paste(flags$Flag[infit_high], "InfitHigh")
+
+  outfit_high <- na_false(flags$Outfit > 2.0)
+  flags$Flag[outfit_high] <- paste(flags$Flag[outfit_high], "OutfitHigh")
 
   flags$Flag <- trimws(flags$Flag)
   flags
