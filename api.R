@@ -1,17 +1,34 @@
 #
-# IRT Analysis API for DLTPT
-# 2PL / Rasch via TAM, with teacher-facing interpretations
-# v1.2 -- steps 1-5: harvest, CTT, information, config/governance, model gate
+# IRT Analysis API for DLTPT  --  v2.0
+# =====================================================================
+# One TAM/plumber service, two engines:
 #
+#   POST /irt   Per-exercise IRT. 2PL/Rasch with N-gated auto-selection,
+#               CTT (Cronbach a), item flags, Yen's Q3 + MADaQ3, per-person
+#               WLE theta+SE, person-fit, ICC + item/test information + SEM,
+#               SEM-at-cut, and teacher-facing interpretations.
+#
+#   POST /form  Form-scope multi-method + Layer C. Runs several methods over
+#               a set of exercises taken by one roster and compares them:
+#               item-level 2PL/Rasch and exercise-level PCM, with cross-method
+#               reliability, theta concordance, classification-at-cut, and
+#               item-difficulty concordance. Exercise-type-agnostic; models
+#               NA as not-administered rather than dropping it.
+#
+# Shared helpers (config, model fits, WLE, item params) serve both engines.
+# Per-request overrides via body$config; see DEFAULTS.
+# =====================================================================
 
 library(plumber)
 library(jsonlite)
 library(TAM)
 
 
-# =========================================================================
-# Config (step 4): defaults in code, overridable per-request via body$config
-# =========================================================================
+# =====================================================================
+# SHARED FOUNDATION
+# =====================================================================
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
 
 DEFAULTS <- list(
   min_n_floor  = 20,      # absolute floor; below this -> error, any model
@@ -28,7 +45,7 @@ DEFAULTS <- list(
     outfit_high   = 2.0
   ),
   theta_grid = list(min = -4, max = 4, n = 100),
-  cut_theta  = NULL       # SEM-at-cut only computed when supplied
+  cut_theta  = NULL       # SEM-at-cut / classification only when supplied
 )
 
 # Shallow-recursive overlay: keeps DEFAULTS keys, replaces where override sets.
@@ -44,15 +61,68 @@ merge_config <- function(defaults, override) {
   defaults
 }
 
-
-# =========================================================================
-# Parsing / shaping helpers (unchanged from v1.1)
-# =========================================================================
-
 parse_body <- function(req) {
   tryCatch(fromJSON(req$postBody), error = function(e) NULL)
 }
 
+na_false <- function(x) { x[is.na(x)] <- FALSE; x }
+
+# ---- model fits ------------------------------------------------------
+fit_2pl <- function(resp) {
+  tryCatch(
+    suppressMessages(tam.mml.2pl(resp, verbose = FALSE)),
+    error = function(e) structure(list(error = e$message), class = "tam_error")
+  )
+}
+
+fit_rasch <- function(resp) {
+  tryCatch(
+    suppressMessages(tam.mml(resp, verbose = FALSE)),
+    error = function(e) structure(list(error = e$message), class = "tam_error")
+  )
+}
+
+fit_pcm <- function(resp) {
+  tryCatch(
+    suppressMessages(tam.mml(resp, irtmodel = "PCM", verbose = FALSE)),
+    error = function(e) structure(list(error = e$message), class = "tam_error")
+  )
+}
+
+# Model-aware item parameters (single source of truth for FIX #1):
+# 2PL difficulty is b = xsi / a; Rasch fixes a = 1 so b = xsi.
+extract_item_params <- function(mod, model_type) {
+  xsi <- mod$xsi$xsi
+  if (model_type == "2pl") {
+    a <- mod$B[, , 1][, 2]
+    b <- xsi / a
+  } else {
+    a <- rep(1, length(xsi))
+    b <- xsi
+  }
+  list(a = as.numeric(a), b = as.numeric(b))
+}
+
+# WLE summary + per-person theta/SE (used by both engines).
+wle_summary <- function(mod) {
+  res   <- tam.wle(mod, progress = FALSE)
+  theta <- res$theta
+  se    <- res$error
+  m <- mean(theta, na.rm = TRUE)
+  s <- sd(theta,   na.rm = TRUE)
+  v <- var(theta,  na.rm = TRUE)
+  rel <- if (!is.na(v) && v > 0) 1 - mean(se^2, na.rm = TRUE) / v else NA_real_
+  rel <- if (!is.na(rel) && rel < 0) 0 else rel
+  list(mean = m, sd = s, reliability = rel,
+       theta = as.numeric(theta), se = as.numeric(se))
+}
+
+
+# =====================================================================
+# PER-EXERCISE ENGINE  (/irt)
+# =====================================================================
+
+# ---- payload shaping (matrix-style body) -----------------------------
 matrix_to_df <- function(matrix_obj) {
   tryCatch({
     rows_list <- if (is.list(matrix_obj$rows[[1]])) matrix_obj$rows else list(matrix_obj$rows)
@@ -68,8 +138,6 @@ strip_id_columns <- function(df) {
   id_idx   <- which(tolower(colnames(df)) %in% id_names)
   if (length(id_idx) > 0) df[, -id_idx, drop = FALSE] else df
 }
-
-na_false <- function(x) { x[is.na(x)] <- FALSE; x }
 
 response_diagnostics <- function(resp) {
   n_total    <- nrow(resp)
@@ -87,56 +155,17 @@ response_diagnostics <- function(resp) {
   )
 }
 
-
-# =========================================================================
-# Model fitting + selection (step 5)
-# =========================================================================
-
-fit_2pl <- function(resp) {
-  tryCatch(
-    suppressMessages(tam.mml.2pl(resp, verbose = FALSE)),
-    error = function(e) structure(list(error = e$message), class = "tam_error")
-  )
-}
-
-fit_rasch <- function(resp) {
-  tryCatch(
-    suppressMessages(tam.mml(resp, verbose = FALSE)),
-    error = function(e) structure(list(error = e$message), class = "tam_error")
-  )
-}
-
-# Decide model. Explicit request overrides the N gate but still obeys the floor
-# (enforced upstream). Returns list(model, selection).
+# Decide model. Explicit request overrides the N gate but still obeys the floor.
 select_model <- function(n_cal, requested, cfg) {
   if (!is.null(requested) && nzchar(requested)) {
     m <- tolower(requested)
-    if (m %in% c("rasch", "1pl"))      return(list(model = "rasch", selection = "explicit"))
-    if (m %in% c("2pl"))               return(list(model = "2pl",   selection = "explicit"))
+    if (m %in% c("rasch", "1pl")) return(list(model = "rasch", selection = "explicit"))
+    if (m %in% c("2pl"))          return(list(model = "2pl",   selection = "explicit"))
     return(list(model = NA, selection = "invalid"))
   }
   if (n_cal >= cfg$twopl_min_n) list(model = "2pl",   selection = "auto")
   else                         list(model = "rasch", selection = "auto")
 }
-
-# Model-aware item parameters. FIX #1 lives here now (single source of truth):
-# 2PL difficulty is b = xsi / a; Rasch fixes a = 1 so b = xsi.
-extract_item_params <- function(mod, model_type) {
-  xsi <- mod$xsi$xsi
-  if (model_type == "2pl") {
-    a <- mod$B[, , 1][, 2]
-    b <- xsi / a
-  } else {
-    a <- rep(1, length(xsi))
-    b <- xsi
-  }
-  list(a = as.numeric(a), b = as.numeric(b))
-}
-
-
-# =========================================================================
-# Item-level flags (step 4: thresholds from cfg)
-# =========================================================================
 
 build_item_flags <- function(resp, a, b, mod, cfg) {
   prop_correct <- colMeans(resp, na.rm = TRUE)
@@ -167,20 +196,19 @@ build_item_flags <- function(resp, a, b, mod, cfg) {
     flags$Flag[m] <<- trimws(paste(flags$Flag[m], tag))
   }
 
-  add(flags$Discrimination < 0 | flags$ItemTotalCor < 0,                 "BROKEN_negDisc")
-  add(flags$Discrimination >= 0 & flags$Discrimination < fc$weak_disc,   "WeakDisc")
-  add(flags$Discrimination > fc$unstable_disc,                           "UnstableDisc")
-  add(flags$PropCorrect > fc$too_easy,                                   "TooEasy")
-  add(flags$PropCorrect < fc$too_hard,                                   "TooHard")
-  add(flags$ItemTotalCor < fc$low_corr & flags$ItemTotalCor >= 0,        "LowCorr")
-  add(flags$Infit  > fc$infit_high,                                      "InfitHigh")
-  add(flags$Outfit > fc$outfit_high,                                     "OutfitHigh")
+  add(flags$Discrimination < 0 | flags$ItemTotalCor < 0,               "BROKEN_negDisc")
+  add(flags$Discrimination >= 0 & flags$Discrimination < fc$weak_disc, "WeakDisc")
+  add(flags$Discrimination > fc$unstable_disc,                         "UnstableDisc")
+  add(flags$PropCorrect > fc$too_easy,                                 "TooEasy")
+  add(flags$PropCorrect < fc$too_hard,                                 "TooHard")
+  add(flags$ItemTotalCor < fc$low_corr & flags$ItemTotalCor >= 0,      "LowCorr")
+  add(flags$Infit  > fc$infit_high,                                    "InfitHigh")
+  add(flags$Outfit > fc$outfit_high,                                   "OutfitHigh")
 
   flags$Flag <- trimws(flags$Flag)
   flags
 }
 
-# Static legend so the frontend can render tiers (step 4).
 flag_legend <- function() {
   list(
     list(code = "BROKEN_negDisc", tier = "severe", text = "Negative discrimination or item-total correlation; item likely broken or mis-keyed."),
@@ -193,11 +221,6 @@ flag_legend <- function() {
     list(code = "OutfitHigh",     tier = "weak",   text = "Outfit above bound; sensitive to unexpected responses by off-target students.")
   )
 }
-
-
-# =========================================================================
-# CTT (step 2)
-# =========================================================================
 
 compute_ctt <- function(resp) {
   k <- ncol(resp)
@@ -217,11 +240,6 @@ compute_ctt <- function(resp) {
   )
 }
 
-
-# =========================================================================
-# Local dependence (step 1: full matrix + configurable thr + MADaQ3)
-# =========================================================================
-
 compute_q3 <- function(mod, cfg) {
   empty_pairs <- data.frame(Item1 = character(0), Item2 = character(0),
                             Q3 = numeric(0), Recommendation = character(0),
@@ -229,7 +247,8 @@ compute_q3 <- function(mod, cfg) {
   q3_result <- tryCatch(suppressWarnings(tam.modelfit(mod, progress = FALSE)),
                         error = function(e) NULL)
   if (is.null(q3_result) || is.null(q3_result$Q3.matr)) {
-    return(list(pairs = empty_pairs, matrix = list(), madaq3 = list(madaq3 = NA, maxaq3 = NA, note = "Q3 unavailable")))
+    return(list(pairs = empty_pairs, matrix = list(),
+                madaq3 = list(madaq3 = NA, maxaq3 = NA, note = "Q3 unavailable")))
   }
 
   q3_mat <- q3_result$Q3.matr
@@ -237,7 +256,6 @@ compute_q3 <- function(mod, cfg) {
   idx    <- which(ut, arr.ind = TRUE)          # column-major, aligns with q3_mat[ut]
   vals   <- q3_mat[ut]
 
-  # Full upper-triangle, long form (every pair, not just flagged).
   full <- data.frame(
     Item1 = colnames(q3_mat)[idx[, 1]],
     Item2 = colnames(q3_mat)[idx[, 2]],
@@ -245,7 +263,6 @@ compute_q3 <- function(mod, cfg) {
     stringsAsFactors = FALSE
   )
 
-  # Flagged pairs above the configured threshold (backward-compatible shape).
   hit <- which(abs(vals) > cfg$q3_threshold)
   pairs <- if (length(hit) == 0) empty_pairs else data.frame(
     Item1 = colnames(q3_mat)[idx[hit, 1]],
@@ -255,7 +272,6 @@ compute_q3 <- function(mod, cfg) {
     stringsAsFactors = FALSE
   )
 
-  # Marais aQ3 centering: aQ3 = Q3 - mean(Q3); MADaQ3 = mean(|aQ3|).
   mean_q3 <- mean(vals, na.rm = TRUE)
   aq3     <- vals - mean_q3
   madaq3  <- list(
@@ -269,25 +285,6 @@ compute_q3 <- function(mod, cfg) {
   list(pairs = pairs, matrix = full, madaq3 = madaq3)
 }
 
-
-# =========================================================================
-# WLE ability (step 1: return per-person theta + SE, not just aggregate)
-# =========================================================================
-
-wle_summary <- function(mod) {
-  res   <- tam.wle(mod, progress = FALSE)
-  theta <- res$theta
-  se    <- res$error
-  m <- mean(theta, na.rm = TRUE)
-  s <- sd(theta,   na.rm = TRUE)
-  v <- var(theta,  na.rm = TRUE)
-  rel <- if (!is.na(v) && v > 0) 1 - mean(se^2, na.rm = TRUE) / v else NA_real_
-  rel <- if (!is.na(rel) && rel < 0) 0 else rel
-  list(mean = m, sd = s, reliability = rel,
-       theta = as.numeric(theta), se = as.numeric(se))
-}
-
-# Person-fit (step 5). Fail-safe: any failure returns NULL, never crashes run.
 person_fit_table <- function(mod, orig_rows) {
   pf <- tryCatch(suppressWarnings(tam.personfit(mod)), error = function(e) NULL)
   if (is.null(pf)) return(NULL)
@@ -304,11 +301,6 @@ person_fit_table <- function(mod, orig_rows) {
     outfit = if (!is.na(oc)) round(as.numeric(pf[[oc]][i]), 3) else NA
   ))
 }
-
-
-# =========================================================================
-# Curves + information (step 3): ICC probability, item info, test info/SEM
-# =========================================================================
 
 build_curves <- function(a, b, item_names, grid) {
   theta <- seq(grid$min, grid$max, length.out = grid$n)
@@ -340,11 +332,7 @@ info_at_cut <- function(a, b, cut) {
        sem = if (I > 0) round(1 / sqrt(I), 4) else NA)
 }
 
-
-# =========================================================================
-# Teacher-facing text generators (unchanged)
-# =========================================================================
-
+# ---- teacher-facing text generators ----------------------------------
 text_eap <- function(r) {
   if (is.na(r))     "EAP reliability could not be estimated from this sample."
   else if (r < 0.7) "EAP reliability is below 0.7. The test cannot reliably separate students."
@@ -407,12 +395,7 @@ build_teacher_message <- function(mean_wle, sd_wle, wle_rel) {
   paste(parts[nzchar(parts)], collapse = "\n")
 }
 
-
-# =========================================================================
-# Analysis core -- callable offline for smoke tests (thin route below)
-# =========================================================================
-# Returns a result list. On failure, returns list(error=..., status_code=NNN).
-
+# ---- /irt analysis core (offline-testable) ---------------------------
 run_analysis <- function(body) {
 
   cfg <- merge_config(DEFAULTS, body$config)
@@ -447,7 +430,6 @@ run_analysis <- function(body) {
       "Too few respondents after removing perfect/zero/incomplete scores (need at least %d).",
       cfg$min_n_floor), status_code = 400))
 
-  # ---- Model selection (step 5) ----
   sel <- select_model(n_cal, body$model, cfg)
   if (is.na(sel$model))
     return(list(error = "Invalid 'model'; expected 'rasch'/'1pl' or '2pl'.", status_code = 400))
@@ -461,7 +443,6 @@ run_analysis <- function(body) {
 
   pars <- extract_item_params(mod, sel$model)
 
-  # ---- Metrics ----
   item_flags <- build_item_flags(resp_cal, pars$a, pars$b, mod, cfg)
   ctt        <- compute_ctt(resp_cal)
   q3         <- compute_q3(mod, cfg)
@@ -481,14 +462,14 @@ run_analysis <- function(body) {
 
   list(
     model = list(
-      type            = if (sel$model == "2pl") "2PL" else "Rasch",
-      package         = "TAM",
-      selection       = sel$selection,
+      type             = if (sel$model == "2pl") "2PL" else "Rasch",
+      package          = "TAM",
+      selection        = sel$selection,
       n_used_for_calib = n_cal,
-      eap_reliability = eap_rel,        eap_text      = text_eap(eap_rel),
-      wle_reliability = wle_rel,        wle_text      = text_wle_rel(wle_rel),
-      wle_mean        = round(wle$mean, 3), wle_mean_text = text_mean(wle$mean),
-      wle_sd          = round(wle$sd, 3),   wle_sd_text   = text_sd(wle$sd)
+      eap_reliability  = eap_rel,           eap_text      = text_eap(eap_rel),
+      wle_reliability  = wle_rel,           wle_text      = text_wle_rel(wle_rel),
+      wle_mean         = round(wle$mean, 3), wle_mean_text = text_mean(wle$mean),
+      wle_sd           = round(wle$sd, 3),   wle_sd_text   = text_sd(wle$sd)
     ),
     ctt                  = ctt,
     items                = item_flags,
@@ -498,7 +479,7 @@ run_analysis <- function(body) {
     correlations         = q3$pairs,      # backward-compatible flagged pairs
     q3_matrix            = q3$matrix,     # full upper triangle
     q3_madaq3            = q3$madaq3,
-    icc                  = curves$icc,    # now includes per-item information
+    icc                  = curves$icc,    # per-item ICC + information
     test_information     = curves$test_information,
     cut                  = cut_info,
     diagnostics          = diag_info,
@@ -509,14 +490,221 @@ run_analysis <- function(body) {
 }
 
 
-# =========================================================================
-# API (thin transport over run_analysis)
-# =========================================================================
+# =====================================================================
+# FORM-SCOPE ENGINE  (/form)  --  multi-method + Layer C
+# =====================================================================
+# Payload (from build_form_matrices; exercise-type-agnostic):
+#   { person_keys,
+#     item:{columns, exercise_id, rows},        # person x item (dichotomous)
+#     exercise:{columns, max_scores, rows},     # person x exercise (0..k sum)
+#     exercises, coverage, methods, config }
+# Cells may be null -> NA = not-administered (MODELLED, not dropped).
+
+# ---- payload block -> numeric matrix (nulls -> NA) -------------------
+block_to_matrix <- function(block) {
+  rows <- block$rows
+  if (is.matrix(rows)) {
+    m <- rows; storage.mode(m) <- "numeric"
+  } else {
+    m <- do.call(rbind, lapply(rows, function(r)
+      vapply(r, function(x) if (is.null(x)) NA_real_ else as.numeric(x), numeric(1))))
+  }
+  colnames(m) <- block$columns
+  m
+}
+
+# NA-aware cleaning: drop only all-NA rows and extreme-on-observed rows.
+clean_matrix <- function(resp, max_scores = NULL) {
+  vapply(seq_len(nrow(resp)), function(i) {
+    row   <- resp[i, ]
+    obs   <- !is.na(row)
+    n_obs <- sum(obs)
+    if (n_obs == 0) return(FALSE)
+    rsum <- sum(row[obs])
+    rmax <- if (is.null(max_scores)) n_obs else sum(max_scores[obs])
+    !(rsum == 0 || rsum == rmax)
+  }, logical(1))
+}
+
+# Native item params per method (best-effort; never fails the run).
+extract_items_generic <- function(mod, method, item_names) {
+  if (method %in% c("item_2pl", "item_rasch")) {
+    p <- extract_item_params(mod, if (method == "item_2pl") "2pl" else "rasch")
+    items <- lapply(seq_along(item_names), function(i)
+      list(item = item_names[i], b = round(p$b[i], 3), a = round(p$a[i], 3)))
+    ord <- item_names[order(p$b)]
+  } else {                                   # PCM: per-exercise mean threshold
+    th <- tryCatch(tam.threshold(mod), error = function(e) NULL)
+    bvec <- if (!is.null(th)) rowMeans(as.matrix(th), na.rm = TRUE)
+            else rep(NA_real_, length(item_names))
+    items <- lapply(seq_along(item_names), function(i)
+      list(item = item_names[i], b = round(bvec[i], 3)))
+    ord <- item_names[order(bvec)]
+  }
+  list(items = items, order = ord)
+}
+
+# Run one method -> COMMON OUTPUT CONTRACT (or {method, error}).
+# {method, scope, model, n_used, person_keys_used, theta, se,
+#  reliability:{eap,wle}, items, item_order}
+run_method <- function(method, item_m, exercise_m, exercise_max, person_keys, cfg) {
+  if (method %in% c("item_2pl", "item_rasch")) {
+    resp <- item_m; max_scores <- NULL; scope <- "item"
+  } else if (method == "exercise_pcm") {
+    resp <- exercise_m; max_scores <- exercise_max; scope <- "exercise"
+  } else {
+    return(list(method = method, error = "unknown method"))
+  }
+  if (is.null(resp) || ncol(resp) < 2)
+    return(list(method = method, error = "matrix unavailable or < 2 columns"))
+
+  keep   <- clean_matrix(resp, max_scores)
+  resp_c <- resp[keep, , drop = FALSE]
+  pk_c   <- as.character(person_keys)[keep]
+
+  floor_n <- cfg$min_n_floor %||% 20
+  if (nrow(resp_c) < floor_n)
+    return(list(method = method,
+                error = sprintf("too few respondents after cleaning (%d < %d)",
+                                nrow(resp_c), floor_n)))
+
+  mod <- switch(method,
+    item_2pl     = fit_2pl(resp_c),
+    item_rasch   = fit_rasch(resp_c),
+    exercise_pcm = fit_pcm(resp_c))
+  if (inherits(mod, "tam_error"))
+    return(list(method = method, error = paste("fit failed:", mod$error)))
+
+  wle <- wle_summary(mod)
+  eap <- tryCatch(round(as.numeric(mod$EAP.rel), 3), error = function(e) NA_real_)
+
+  theta <- as.numeric(wle$theta); se <- as.numeric(wle$se)
+  names(theta) <- pk_c; names(se) <- pk_c
+
+  it <- tryCatch(extract_items_generic(mod, method, colnames(resp_c)),
+                 error = function(e) list(items = NULL, order = NULL))
+
+  list(
+    method = method, scope = scope,
+    model  = switch(method, item_2pl = "2PL", item_rasch = "Rasch", exercise_pcm = "PCM"),
+    n_used = nrow(resp_c),
+    person_keys_used = pk_c,
+    theta = as.list(theta), se = as.list(se),
+    reliability = list(
+      eap = eap,
+      wle = if (!is.na(wle$reliability)) round(wle$reliability, 3) else NA_real_
+    ),
+    items = it$items, item_order = it$order,
+    .theta = theta   # out-of-band for Layer C; dropped before serialize
+  )
+}
+
+# Manual Cohen's kappa (2x2, no new dep).
+cohen_kappa <- function(a, b) {
+  tab <- table(factor(a, levels = c(0, 1)), factor(b, levels = c(0, 1)))
+  n <- sum(tab); if (n == 0) return(NA_real_)
+  po <- sum(diag(tab)) / n
+  pe <- sum(rowSums(tab) * colSums(tab)) / (n^2)
+  if (pe == 1) return(NA_real_)
+  round((po - pe) / (1 - pe), 3)
+}
+
+# Layer C: cross-method comparison over whatever methods succeeded.
+layer_c <- function(results, cfg) {
+  ok <- Filter(function(r) is.null(r$error), results)
+
+  rel_tbl <- lapply(ok, function(r) list(
+    method = r$method, scope = r$scope, model = r$model,
+    n_used = r$n_used, eap = r$reliability$eap, wle = r$reliability$wle))
+
+  pearson <- list(); spearman <- list(); classification <- NULL
+  cut <- cfg$cut_theta
+  if (!is.null(cut)) kappa <- list()
+
+  if (length(ok) >= 2) {
+    for (i in 1:(length(ok) - 1)) for (j in (i + 1):length(ok)) {
+      a <- ok[[i]]; b <- ok[[j]]
+      common <- intersect(names(a$.theta), names(b$.theta))
+      key <- paste0(a$method, "~", b$method)
+      if (length(common) >= 3) {
+        ta <- a$.theta[common]; tb <- b$.theta[common]
+        pearson[[key]]  <- round(cor(ta, tb), 3)
+        spearman[[key]] <- round(cor(ta, tb, method = "spearman"), 3)
+        if (!is.null(cut))
+          kappa[[key]] <- cohen_kappa(as.integer(ta >= cut), as.integer(tb >= cut))
+      } else {
+        pearson[[key]] <- NA_real_; spearman[[key]] <- NA_real_
+        if (!is.null(cut)) kappa[[key]] <- NA_real_
+      }
+    }
+  }
+  n_common_all <- if (length(ok) >= 2)
+    length(Reduce(intersect, lapply(ok, function(r) names(r$.theta)))) else NA_integer_
+  if (!is.null(cut)) classification <- list(cut = cut, kappa = kappa)
+
+  # item difficulty concordance among item-scope methods (shared item set)
+  item_ms <- Filter(function(r) r$scope == "item" && !is.null(r$items), ok)
+  item_conc <- NULL
+  if (length(item_ms) >= 2) {
+    bmap <- lapply(item_ms, function(r)
+      setNames(vapply(r$items, function(it) it$b, numeric(1)),
+               vapply(r$items, function(it) it$item, character(1))))
+    sp <- list()
+    for (i in 1:(length(item_ms) - 1)) for (j in (i + 1):length(item_ms)) {
+      ci  <- intersect(names(bmap[[i]]), names(bmap[[j]]))
+      key <- paste0(item_ms[[i]]$method, "~", item_ms[[j]]$method)
+      sp[[key]] <- if (length(ci) >= 3)
+        round(cor(bmap[[i]][ci], bmap[[j]][ci], method = "spearman"), 3) else NA_real_
+    }
+    item_conc <- list(spearman_b = sp)
+  }
+
+  list(
+    reliability_table = rel_tbl,
+    theta_concordance = list(n_common_all = n_common_all,
+                             pearson = pearson, spearman = spearman),
+    classification = classification,
+    item_difficulty_concordance = item_conc
+  )
+}
+
+# ---- /form analysis core (offline-testable) --------------------------
+run_form_analysis <- function(body) {
+  cfg     <- merge_config(DEFAULTS, body$config)
+  methods <- body$methods
+  if (is.null(methods) || length(methods) == 0) methods <- c("item_2pl", "exercise_pcm")
+  person_keys <- as.character(body$person_keys)
+
+  item_m       <- if (!is.null(body$item))     block_to_matrix(body$item)          else NULL
+  exercise_m   <- if (!is.null(body$exercise)) block_to_matrix(body$exercise)      else NULL
+  exercise_max <- if (!is.null(body$exercise)) as.numeric(body$exercise$max_scores) else NULL
+  # body$item$exercise_id reserved for bifactor (later method); unused here.
+
+  results <- lapply(methods, function(m)
+    run_method(m, item_m, exercise_m, exercise_max, person_keys, cfg))
+
+  comparison <- layer_c(results, cfg)
+  results <- lapply(results, function(r) { r$.theta <- NULL; r })
+
+  list(
+    methods_requested = methods,
+    results           = results,
+    comparison        = comparison,
+    coverage          = body$coverage,
+    exercises         = body$exercises,
+    config_used       = cfg
+  )
+}
+
+
+# =====================================================================
+# ROUTES
+# =====================================================================
 
 #* @apiTitle IRT Analysis for DLTPT
-#* @apiDescription 2PL/Rasch IRT analysis, CTT, information, diagnostics, and teacher-facing interpretations.
+#* @apiDescription Per-exercise IRT (/irt) and form-scope multi-method + Layer C (/form).
 
-#* Run IRT analysis on a response matrix
+#* Per-exercise IRT analysis on a response matrix
 #* @post /irt
 #* @post /irt/
 #* @serializer json
@@ -534,8 +722,27 @@ function(req, res) {
   out
 }
 
+#* Form-scope multi-method + Layer C analysis
+#* @post /form
+#* @post /form/
+#* @serializer json
+function(req, res) {
+  body <- parse_body(req)
+  if (is.null(body)) { res$status <- 400; return(list(error = "Invalid JSON in request body.")) }
+  if (is.null(body$person_keys) || (is.null(body$item) && is.null(body$exercise))) {
+    res$status <- 400
+    return(list(error = "Missing person_keys and at least one of item/exercise."))
+  }
+  tryCatch(
+    run_form_analysis(body),
+    error = function(e) { res$status <- 500;
+      list(error = paste("form analysis failed:", conditionMessage(e))) }
+  )
+}
+
 #* Health check
 #* @get /
 function() {
-  list(status = "ok", service = "DLTPT IRT", version = "1.2")
+  list(status = "ok", service = "DLTPT IRT", version = "2.0",
+       engines = c("irt", "form"))
 }
