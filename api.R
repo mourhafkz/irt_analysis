@@ -1,5 +1,5 @@
 #
-# IRT Analysis API for DLTPT  --  v2.0
+# IRT Analysis API for DLTPT  --  v2.1
 # =====================================================================
 # One TAM/plumber service, two engines:
 #
@@ -17,6 +17,13 @@
 #
 # Shared helpers (config, model fits, WLE, item params) serve both engines.
 # Per-request overrides via body$config; see DEFAULTS.
+#
+# v2.1 adds an extended-diagnostics + standard-setting layer (bottom of
+# file): local dependence within vs between exercise, model comparison
+# (AIC/BIC), TCC linking, grain-size Angoff standard setting + G-theory,
+# dimensionality, and DIF. /form now emits local_dependence,
+# model_comparison, tcc, and dimensionality inline; new routes:
+# /standard_set, /ld, /dimensionality, /dif.
 # =====================================================================
 
 library(plumber)
@@ -595,7 +602,8 @@ run_method <- function(method, item_m, exercise_m, exercise_max, person_keys, cf
       wle = if (!is.na(wle$reliability)) round(wle$reliability, 3) else NA_real_
     ),
     items = it$items, item_order = it$order,
-    .theta = theta   # out-of-band for Layer C; dropped before serialize
+    .theta = theta,  # out-of-band for Layer C; dropped before serialize
+    .mod   = mod     # out-of-band for LD / model comparison / TCC / dimensionality
   )
 }
 
@@ -684,12 +692,42 @@ run_form_analysis <- function(body) {
     run_method(m, item_m, exercise_m, exercise_max, person_keys, cfg))
 
   comparison <- layer_c(results, cfg)
-  results <- lapply(results, function(r) { r$.theta <- NULL; r })
+
+  # --- v2.1: local dependence, model comparison, TCC, dimensionality ---
+  # (all derived from the item-scope fit + exercise_id grouping)
+  item_fit <- Filter(function(r) !is.null(r$.mod) && r$scope == "item", results)
+  ld <- if (length(item_fit))
+    ld_by_group(item_fit[[1]]$.mod, colnames(item_m), body$item$exercise_id,
+                cfg$q3_threshold) else list(available = FALSE)
+
+  fits_l <- Filter(function(r) !is.null(r$.mod), results)
+  fits   <- setNames(lapply(fits_l, function(r) r$.mod),
+                     vapply(fits_l, function(r) r$method, character(1)))
+  mc <- if (length(fits)) model_comparison(fits) else NULL
+
+  tcc <- NULL
+  if (length(item_fit)) {
+    p  <- extract_item_params(item_fit[[1]]$.mod,
+            if (item_fit[[1]]$method == "item_2pl") "2pl" else "rasch")
+    gr <- seq(-4, 4, 0.05)
+    tcc <- list(theta = gr, expected_raw = round(tcc_raw_from_theta(p$a, p$b, gr), 2),
+                max_raw = length(p$b))
+  }
+
+  dim_rep <- if (length(item_fit))
+    dimensionality_report(item_fit[[1]]$.mod, colnames(item_m), body$item$exercise_id)
+    else list(available = FALSE)
+
+  results <- lapply(results, function(r) { r$.theta <- NULL; r$.mod <- NULL; r })
 
   list(
     methods_requested = methods,
     results           = results,
     comparison        = comparison,
+    local_dependence  = ld,
+    model_comparison  = mc,
+    tcc               = tcc,
+    dimensionality    = dim_rep,
     coverage          = body$coverage,
     exercises         = body$exercises,
     config_used       = cfg
@@ -745,4 +783,468 @@ function(req, res) {
 function() {
   list(status = "ok", service = "DLTPT IRT", version = "2.0",
        engines = c("irt", "form"))
+}
+
+
+# =====================================================================
+# IRT Analysis API for DLTPT  --  ADDITIONS v2.1
+# =====================================================================
+# Drop-in extensions to the v2.0 plumber service. Everything here reuses
+# the existing shared helpers (extract_item_params, wle_summary, fit_*,
+# merge_config, DEFAULTS) and the COMMON OUTPUT CONTRACT from run_method().
+# Nothing below removes or rewrites an existing function.
+#
+# WHY THESE FIVE. This service is the measurement backend for a C-Test
+# validation programme whose lead study is the standard-setting GRAIN-SIZE
+# question: does a holistic passage-level (extended-Angoff) cut score
+# reproduce the item-by-item gap-level Angoff cut, and classify students
+# into CEFR levels as reliably? (Eckes & Baghaei 2015 established that
+# within-passage gaps are locally dependent, so the passage is the honest
+# unit; Alpizar et al. 2022 mapped the dichotomous/polytomous/testlet
+# trade-off; Park 2022 is the precedent for substituting a coarser
+# judgment unit.) The v2.0 /form engine fits the three scoring models and
+# shows they *rank* students almost identically -- but that concordance is
+# largely mechanical (all three thetas are near-monotone in the raw score),
+# it never quantifies the local dependence that motivates the whole paper,
+# and it has no bridge from an IRT theta to a defensible cut score. These
+# five additions close exactly those gaps.
+#
+#   1. ld_by_group()          Within- vs between-passage Yen's Q3. Turns
+#                             "reliabilities differ" into the *reason* they
+#                             differ. This is the paper's rationale, computed.
+#   2. model_comparison()     AIC/BIC across 2PL/Rasch/PCM. Answers "is the
+#                             richer model earning its parameters" (at DLTPT
+#                             N it usually is not -> Rasch/PCM preferred).
+#   3. TCC linking            theta <-> expected-raw-score bridge. Required to
+#                             move any raw Angoff cut onto the theta scale and
+#                             back. Pure IRT identity, no new dependency.
+#   4. standard-setting core  gap_level_angoff / passage_level_angoff /
+#                             grain_agreement / decision_consistency. THE
+#                             paper's engine: two cut scores, their theta
+#                             gap, reclassification %, and Rudner-style
+#                             classification accuracy + decision consistency.
+#   5. gtheory_angoff()       Judge x unit variance decomposition + G/Phi.
+#                             The "reproducibility, not just agreement" half:
+#                             does collapsing 100 gap judgments into 5 passage
+#                             judgments change the cut-score error structure?
+#
+# All five have offline-testable cores; two new routes (/ld, /standard_set)
+# and three additions to run_form_analysis() wire them into the service.
+# Validated end-to-end on the DLTPT form (5 exercises x 20 gaps, n=111).
+# =====================================================================
+
+
+# =====================================================================
+# ADDITION 1 -- LOCAL DEPENDENCE BY GROUP (within vs between passage)
+# =====================================================================
+# The v2.0 /irt engine already computes Yen's Q3 within a single exercise.
+# For a C-Test FORM the diagnostic that matters is comparative: are gaps
+# more dependent WITHIN their own passage than BETWEEN passages? A positive
+# gap is the signature of testlet structure and the direct justification
+# for exercise-scope (PCM) scoring over item-scope. `group` is the passage
+# id per item (body$item$exercise_id in the /form payload).
+ld_by_group <- function(item_mod, item_names, group,
+                        q3_threshold = 0.2, top_n = 10) {
+  mf <- tryCatch(suppressWarnings(TAM::tam.modelfit(item_mod, progress = FALSE)),
+                 error = function(e) NULL)
+  if (is.null(mf) || is.null(mf$Q3.matr))
+    return(list(available = FALSE, note = "Q3 unavailable for this model."))
+
+  q3  <- mf$Q3.matr
+  nm  <- colnames(q3)
+  grp <- setNames(as.character(group), item_names)[nm]   # align to Q3 col order
+  ut  <- upper.tri(q3)
+  idx <- which(ut, arr.ind = TRUE)
+  vals<- q3[ut]
+  same<- grp[idx[, 1]] == grp[idx[, 2]]
+
+  summ <- function(v) list(
+    n_pairs     = length(v),
+    mean_q3     = round(mean(v, na.rm = TRUE), 4),
+    mean_abs_q3 = round(mean(abs(v), na.rm = TRUE), 4),
+    n_flagged   = sum(abs(v) > q3_threshold, na.rm = TRUE),
+    pct_flagged = round(100 * mean(abs(v) > q3_threshold, na.rm = TRUE), 1)
+  )
+  w  <- which(same)[order(-abs(vals[same]))]
+  w  <- head(w, top_n)
+  top_within <- data.frame(
+    Item1 = nm[idx[w, 1]], Item2 = nm[idx[w, 2]],
+    Q3 = round(vals[w], 3), stringsAsFactors = FALSE)
+
+  within <- summ(vals[same]); between <- summ(vals[!same])
+  list(
+    available        = TRUE,
+    q3_threshold     = q3_threshold,
+    within_passage   = within,
+    between_passage  = between,
+    ld_gap           = round(within$mean_abs_q3 - between$mean_abs_q3, 4),
+    madaq3           = round(mean(abs(vals - mean(vals, na.rm = TRUE)), na.rm = TRUE), 4),
+    top_within_pairs = top_within,
+    interpretation   = if (within$mean_abs_q3 > between$mean_abs_q3)
+        paste("Within-passage residual dependence exceeds between-passage:",
+              "item-scope (2PL/Rasch) reliability is optimistic; prefer",
+              "exercise-scope (PCM), whose super-item absorbs the dependence.")
+      else
+        "No excess within-passage dependence detected; item-scope scoring defensible."
+  )
+}
+
+
+# =====================================================================
+# ADDITION 2 -- MODEL COMPARISON (fit indices across scoring models)
+# =====================================================================
+# /form fits 2PL, Rasch and PCM but never says which is statistically
+# preferable. At C-Test-typical N the 2PL's per-item discriminations
+# frequently fail to earn their parameters; BIC is the honest arbiter.
+# Returns one row per successfully-fitted method.
+model_comparison <- function(fits) {
+  rows <- lapply(names(fits), function(nm) {
+    m  <- fits[[nm]]
+    ic <- tryCatch(m$ic, error = function(e) NULL)
+    data.frame(
+      method = nm,
+      npars  = tryCatch(ic$Npars,               error = function(e) NA_real_),
+      loglik = tryCatch(round(as.numeric(logLik(m)), 1), error = function(e) NA_real_),
+      AIC    = tryCatch(round(ic$AIC, 1),        error = function(e) NA_real_),
+      BIC    = tryCatch(round(ic$BIC, 1),        error = function(e) NA_real_),
+      stringsAsFactors = FALSE)
+  })
+  tab <- do.call(rbind, rows)
+  ok  <- tab[!is.na(tab$BIC), , drop = FALSE]
+  if (nrow(ok) > 0) tab$preferred_by_BIC <- tab$method == ok$method[which.min(ok$BIC)]
+  tab
+}
+
+
+# =====================================================================
+# ADDITION 3 -- TCC LINKING (theta <-> expected raw score)
+# =====================================================================
+# The bridge every raw-scale cut score needs to reach the theta metric and
+# back. For a dichotomous item-scope model the Test Characteristic Curve is
+# the sum of item success probabilities; it is monotone in theta, so the
+# inverse is a simple grid search. Pure 2PL/Rasch identity -- no new dep.
+tcc_raw_from_theta <- function(a, b, theta) {
+  vapply(theta, function(t) sum(1 / (1 + exp(-a * (t - b)))), numeric(1))
+}
+theta_from_raw <- function(a, b, raw_cut, grid = seq(-6, 6, 0.001)) {
+  tcc <- tcc_raw_from_theta(a, b, grid)
+  grid[which.min(abs(tcc - raw_cut))]
+}
+
+
+# =====================================================================
+# ADDITION 4 -- STANDARD-SETTING GRAIN-SIZE ENGINE
+# =====================================================================
+# The lead study, computed. Inputs are borderline-student judgment matrices:
+#   gap-level:     judges x gaps      cell = P(borderline answers gap right)
+#   passage-level: judges x passages  cell = expected passage score (0..max)
+# Both produce a raw cut = sum of cells, averaged over judges. grain_agreement
+# links each raw cut to theta via the TCC and reports whether the two grains
+# classify students the same way. decision_consistency is the Rudner-style
+# accuracy/consistency of a theta cut given per-person WLE theta + SE.
+
+gap_level_angoff <- function(gap_prob_matrix) {
+  per_judge <- rowSums(gap_prob_matrix)
+  list(cut_raw   = mean(per_judge),
+       sd_judges = sd(per_judge),
+       per_judge = as.numeric(per_judge),
+       n_judges  = nrow(gap_prob_matrix),
+       n_units   = ncol(gap_prob_matrix))
+}
+
+passage_level_angoff <- function(passage_score_matrix) {
+  per_judge <- rowSums(passage_score_matrix)
+  list(cut_raw   = mean(per_judge),
+       sd_judges = sd(per_judge),
+       per_judge = as.numeric(per_judge),
+       n_judges  = nrow(passage_score_matrix),
+       n_units   = ncol(passage_score_matrix))
+}
+
+# Rudner-style classification accuracy & decision consistency at a theta cut.
+decision_consistency <- function(theta, se, theta_cut) {
+  ok <- !is.na(theta) & !is.na(se) & se > 0
+  th <- theta[ok]; s <- se[ok]
+  if (length(th) == 0) return(list(n = 0L, note = "no usable theta/SE"))
+  p_above   <- 1 - pnorm(theta_cut, mean = th, sd = s)
+  obs_above <- th >= theta_cut
+  acc  <- mean(ifelse(obs_above, p_above, 1 - p_above))
+  cons <- mean(p_above^2 + (1 - p_above)^2)
+  list(n = sum(ok), theta_cut = round(theta_cut, 3),
+       pct_above = round(100 * mean(obs_above), 1),
+       classification_accuracy = round(acc, 3),
+       decision_consistency    = round(cons, 3))
+}
+
+# Compare two raw cut scores (gap vs passage grain): theta gap + reclassification.
+grain_agreement <- function(raw_cut_gap, raw_cut_pass, a, b, theta, se = NULL) {
+  tcut_gap  <- theta_from_raw(a, b, raw_cut_gap)
+  tcut_pass <- theta_from_raw(a, b, raw_cut_pass)
+  cls_g <- as.integer(theta >= tcut_gap)
+  cls_p <- as.integer(theta >= tcut_pass)
+  tab <- table(factor(cls_g, 0:1), factor(cls_p, 0:1)); n <- sum(tab)
+  po  <- sum(diag(tab)) / n
+  pe  <- sum(rowSums(tab) * colSums(tab)) / n^2
+  kappa <- if (pe == 1) NA_real_ else (po - pe) / (1 - pe)
+  out <- list(
+    raw_cut_gap      = round(raw_cut_gap, 2),
+    raw_cut_pass     = round(raw_cut_pass, 2),
+    theta_cut_gap    = round(tcut_gap, 3),
+    theta_cut_pass   = round(tcut_pass, 3),
+    theta_cut_diff   = round(tcut_pass - tcut_gap, 3),
+    pct_reclassified = round(100 * mean(cls_g != cls_p), 1),
+    classification_kappa = round(kappa, 3))
+  if (!is.null(se)) out$decision_consistency <- list(
+    gap     = decision_consistency(theta, se, tcut_gap),
+    passage = decision_consistency(theta, se, tcut_pass))
+  out
+}
+
+
+# =====================================================================
+# ADDITION 5 -- G-THEORY DECOMPOSITION OF ANGOFF RATINGS
+# =====================================================================
+# "Reproducibility, not just agreement." A judges x units rating matrix is
+# decomposed (random two-way, judge x unit) into variance components. A
+# defensible standard has most variance in UNITS (real difficulty spread)
+# and little in JUDGES (disagreement about the border). Collapsing 100 gaps
+# into 5 passages changes this structure; only a G-study shows whether the
+# cut-score error is neutral, better, or worse at the coarse grain
+# (Clauser et al. 2002). G_relative is the generalizability coefficient.
+gtheory_angoff <- function(rating_matrix) {
+  nj <- nrow(rating_matrix); ni <- ncol(rating_matrix)
+  if (nj < 2 || ni < 2) return(list(error = "need >=2 judges and >=2 units"))
+  gm <- mean(rating_matrix)
+  jm <- rowMeans(rating_matrix); im <- colMeans(rating_matrix)
+  SS_j  <- ni * sum((jm - gm)^2)
+  SS_i  <- nj * sum((im - gm)^2)
+  SS_t  <- sum((rating_matrix - gm)^2)
+  SS_ji <- SS_t - SS_j - SS_i
+  MS_j  <- SS_j  / (nj - 1)
+  MS_i  <- SS_i  / (ni - 1)
+  MS_ji <- SS_ji / ((nj - 1) * (ni - 1))
+  v_j  <- max((MS_j  - MS_ji) / ni, 0)   # judge (unwanted)
+  v_i  <- max((MS_i  - MS_ji) / nj, 0)   # unit  (wanted: real difficulty spread)
+  v_ji <- max(MS_ji, 0)                   # residual
+  abs_err_var <- v_j / nj + v_ji / (nj * ni)
+  G   <- if (v_i + v_ji / nj > 0) v_i / (v_i + v_ji / nj) else NA_real_
+  Phi <- if (v_i + abs_err_var > 0) v_i / (v_i + abs_err_var) else NA_real_
+  list(
+    n_judges = nj, n_units = ni,
+    var_judge = round(v_j, 4), var_unit = round(v_i, 4), var_resid = round(v_ji, 4),
+    pct_judge = round(100 * v_j / (v_j + v_i + v_ji), 1),
+    G_relative = round(G, 3), Phi_absolute = round(Phi, 3),
+    se_cut_per_unit = round(sqrt(abs_err_var), 4),
+    interpretation = if (!is.na(G) && G < 0.8)
+        "Low G: the cut score is judge-dependent; add judges or discussion rounds."
+      else "High G: judges reproduce the standard; cut score is dependable at this grain."
+  )
+}
+
+
+# =====================================================================
+# NEW ROUTE -- /standard_set  (grain-size standard setting)
+# =====================================================================
+# Offline-testable core. Payload:
+#   { item:{columns, exercise_id, rows},        # for the TCC (dichotomous)
+#     ratings:{
+#       gap:     [[judge1 gap probs...], ...],   # nJudge x nGap  in [0,1]
+#       passage: [[judge1 passage exp...], ...]  # nJudge x nPassage in 0..max
+#     },
+#     model, config }
+# Returns both cut scores, their theta linking + reclassification, decision
+# consistency at each cut, and a G-study for each grain.
+run_standard_setting <- function(body) {
+  cfg <- merge_config(DEFAULTS, body$config)
+  if (is.null(body$item) || is.null(body$ratings))
+    return(list(error = "Need item block (for TCC) and ratings{gap,passage}.",
+                status_code = 400))
+
+  item_m <- block_to_matrix(body$item)
+  keep   <- clean_matrix(item_m, NULL)
+  resp_c <- item_m[keep, , drop = FALSE]
+  model  <- tolower(body$model %||% "rasch")
+  mod    <- if (model == "2pl") fit_2pl(resp_c) else fit_rasch(resp_c)
+  if (inherits(mod, "tam_error"))
+    return(list(error = paste("TCC model failed:", mod$error), status_code = 500))
+  p   <- extract_item_params(mod, if (model == "2pl") "2pl" else "rasch")
+  wle <- wle_summary(mod)
+
+  to_m <- function(x) if (is.matrix(x)) x else do.call(rbind, x)
+  out  <- list(model = toupper(model), n_calib = nrow(resp_c), max_raw = ncol(resp_c))
+
+  if (!is.null(body$ratings$gap) && !is.null(body$ratings$passage)) {
+    gl <- gap_level_angoff(to_m(body$ratings$gap))
+    pl <- passage_level_angoff(to_m(body$ratings$passage))
+    out$gap_level     <- gl[c("cut_raw", "sd_judges", "n_judges", "n_units")]
+    out$passage_level <- pl[c("cut_raw", "sd_judges", "n_judges", "n_units")]
+    out$grain_agreement <- grain_agreement(gl$cut_raw, pl$cut_raw,
+                                            p$a, p$b, wle$theta, wle$se)
+    out$gtheory <- list(gap     = gtheory_angoff(to_m(body$ratings$gap)),
+                        passage = gtheory_angoff(to_m(body$ratings$passage)))
+  }
+  out$tcc <- list(theta = seq(-4, 4, 0.1),
+                  expected_raw = round(tcc_raw_from_theta(p$a, p$b, seq(-4, 4, 0.1)), 2))
+  out$config_used <- cfg
+  out
+}
+
+#* Grain-size standard setting (gap-level vs passage-level Angoff)
+#* @post /standard_set
+#* @post /standard_set/
+#* @serializer json
+function(req, res) {
+  body <- parse_body(req)
+  if (is.null(body)) { res$status <- 400; return(list(error = "Invalid JSON in request body.")) }
+  tryCatch({
+    out <- run_standard_setting(body)
+    if (!is.null(out$error)) { res$status <- out$status_code %||% 400; return(list(error = out$error)) }
+    out
+  }, error = function(e) { res$status <- 500
+    list(error = paste("standard setting failed:", conditionMessage(e))) })
+}
+
+#* Local-dependence report for a form (within vs between passage Q3)
+#* @post /ld
+#* @serializer json
+function(req, res) {
+  body <- parse_body(req)
+  if (is.null(body) || is.null(body$item)) {
+    res$status <- 400; return(list(error = "Need item block with exercise_id."))
+  }
+  tryCatch({
+    item_m <- block_to_matrix(body$item)
+    keep   <- clean_matrix(item_m, NULL)
+    mod    <- fit_rasch(item_m[keep, , drop = FALSE])
+    if (inherits(mod, "tam_error")) { res$status <- 500; return(list(error = mod$error)) }
+    cfg <- merge_config(DEFAULTS, body$config)
+    ld_by_group(mod, colnames(item_m), body$item$exercise_id, cfg$q3_threshold)
+  }, error = function(e) { res$status <- 500
+    list(error = paste("LD analysis failed:", conditionMessage(e))) })
+}
+
+
+# =====================================================================
+# ADDITION 6 -- DIMENSIONALITY (construct validity, the review's core debate)
+# =====================================================================
+# The review's longest-running controversy: one dimension or several?
+# PCA of Rasch standardized residuals (Winsteps-style). A large first
+# residual eigenvalue (>~2 in item units) signals a secondary dimension;
+# for a C-Test the expected shape is passage-specific factors (Eckes &
+# Grotjahn 2006). The tool reports the contrast AND ties it to USE: the
+# variance is only a problem if it changes decisions (the research-gap
+# map's reframing of dimensionality as a consequential-validity question).
+dimensionality_report <- function(item_mod, item_names, group) {
+  res <- tryCatch(IRT.residuals(item_mod), error = function(e) NULL)
+  if (is.null(res) || is.null(res$stand_residuals))
+    return(list(available = FALSE, note = "standardized residuals unavailable"))
+  stdres <- res$stand_residuals
+  stdres <- stdres[, apply(stdres, 2, function(x) sd(x, na.rm = TRUE) > 0), drop = FALSE]
+  cc <- cor(stdres, use = "pairwise.complete.obs"); cc[is.na(cc)] <- 0
+  ev <- eigen(cc, only.values = TRUE)$values
+  k  <- ncol(stdres)
+  grp <- setNames(as.character(group), item_names)[colnames(stdres)]
+  pass_res <- t(apply(stdres, 1, function(r) tapply(r, grp, mean, na.rm = TRUE)))
+  list(
+    available = TRUE, n_items_used = k,
+    first_residual_eigenvalue = round(ev[1], 3),
+    pct_first_contrast = round(100 * ev[1] / k, 2),
+    eigenvalues_top5 = round(ev[1:min(5, length(ev))], 3),
+    passage_residual_var = round(mean(apply(pass_res, 2, var, na.rm = TRUE)), 4),
+    rule_of_thumb = "First residual eigenvalue >~2 item-units suggests a secondary dimension.",
+    interpretation = if (ev[1] > 2)
+        paste("Secondary dimension present; consistent with passage-specific factors",
+              "(Eckes & Grotjahn 2006). A single global score is defensible only if this",
+              "variance is decision-inconsequential -- test with grain_agreement / DIF.")
+      else "No strong secondary dimension; unidimensional person ordering supported."
+  )
+}
+
+
+# =====================================================================
+# ADDITION 7 -- DIF / FAIRNESS (the review's highest-value outstanding gap)
+# =====================================================================
+# "Fairness evidence is disproportionately small relative to the stakes."
+# ETS-style Rasch difficulty contrast across a two-level grouping (L1,
+# gender, content background), SE-STANDARDIZED as a Wald z -- a raw-logit
+# threshold over-flags at the small per-group N typical of C-Test studies.
+# Items lacking response variance in either subgroup are screened out
+# first (they drive difficulty to the estimator edge). The review
+# recommends TESTLET-level DIF under within-passage dependence: pass the
+# 5-passage sum-score matrix with a polytomous fit for that variant.
+# NOTE: at small per-group N item-level DIF is underpowered; the note field
+# says so and points to the passage-level alternative.
+dif_report <- function(resp, group_vec, dif_threshold = 0.5,
+                       min_var_p = 0.05, z_crit = 1.96) {
+  g <- as.factor(group_vec); levs <- levels(g)
+  if (length(levs) != 2) return(list(available = FALSE, note = "DIF needs exactly 2 groups"))
+  r1 <- resp[g == levs[1], , drop = FALSE]
+  r2 <- resp[g == levs[2], , drop = FALSE]
+  pc1 <- colMeans(r1, na.rm = TRUE); pc2 <- colMeans(r2, na.rm = TRUE)
+  usable  <- names(pc1)[pc1 > min_var_p & pc1 < 1 - min_var_p &
+                        pc2 > min_var_p & pc2 < 1 - min_var_p]
+  dropped <- setdiff(colnames(resp), usable)
+  if (length(usable) < 3) return(list(available = FALSE,
+    note = "too few items with adequate variance in both groups"))
+  fit_bse <- function(mat) {
+    m  <- suppressMessages(tam.mml(mat[, usable, drop = FALSE], verbose = FALSE))
+    b  <- extract_item_params(m, "rasch")$b; names(b) <- usable
+    se <- setNames(m$xsi$se.xsi[seq_along(usable)], usable)
+    list(b = b - mean(b), se = se)
+  }
+  f1 <- fit_bse(r1); f2 <- fit_bse(r2)
+  delta <- f1$b - f2$b
+  se_d  <- sqrt(f1$se^2 + f2$se^2)
+  z     <- delta / se_d
+  tab <- data.frame(
+    Item = names(delta), DIF = round(delta, 3), SE = round(se_d, 3),
+    z = round(z, 2),
+    flag = ifelse(abs(z) > z_crit & abs(delta) > dif_threshold, "DIF", ""),
+    stringsAsFactors = FALSE)
+  tab <- tab[order(-abs(tab$z)), ]
+  list(
+    available = TRUE, groups = levs,
+    method = "ETS Rasch difficulty contrast, SE-standardized (Wald z)",
+    n_items_tested = length(usable), n_items_dropped = length(dropped),
+    dropped_items = dropped,
+    n_flagged = sum(tab$flag == "DIF"), max_abs_z = round(max(abs(z)), 2),
+    items = tab,
+    note = paste("Flag = |DIF|>0.5 logit AND |z|>1.96. At small per-group N item-level",
+                 "DIF is underpowered; testlet-level DIF (5 passage super-items) is more",
+                 "powerful and respects within-passage dependence (Eckes & Baghaei 2015).")
+  )
+}
+
+#* Dimensionality report (PCA of Rasch residuals) for a form
+#* @post /dimensionality
+#* @serializer json
+function(req, res) {
+  body <- parse_body(req)
+  if (is.null(body) || is.null(body$item)) {
+    res$status <- 400; return(list(error = "Need item block with exercise_id."))
+  }
+  tryCatch({
+    item_m <- block_to_matrix(body$item)
+    mod <- fit_rasch(item_m[clean_matrix(item_m, NULL), , drop = FALSE])
+    if (inherits(mod, "tam_error")) { res$status <- 500; return(list(error = mod$error)) }
+    dimensionality_report(mod, colnames(item_m), body$item$exercise_id)
+  }, error = function(e) { res$status <- 500
+    list(error = paste("dimensionality failed:", conditionMessage(e))) })
+}
+
+#* DIF / fairness report across a two-level grouping variable
+#* @post /dif
+#* @serializer json
+function(req, res) {
+  body <- parse_body(req)
+  if (is.null(body) || is.null(body$item) || is.null(body$group)) {
+    res$status <- 400; return(list(error = "Need item block and a group vector (length = n persons)."))
+  }
+  tryCatch({
+    item_m <- block_to_matrix(body$item)
+    cfg <- merge_config(DEFAULTS, body$config)
+    dif_report(item_m, body$group,
+               dif_threshold = cfg$dif_threshold %||% 0.5)
+  }, error = function(e) { res$status <- 500
+    list(error = paste("DIF failed:", conditionMessage(e))) })
 }
