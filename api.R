@@ -29,8 +29,11 @@
 library(plumber)
 library(jsonlite)
 library(TAM)
-library(mirt)     # bifactor (v2.2)
-library(mokken)   # nonparametric scaling (v2.2)
+# NB: mirt (bifactor) and mokken (nonparametric scaling) are OPTIONAL.
+# They are never attached with library() -- every call is namespaced
+# (mirt::, mokken::) behind a requireNamespace() guard, so the service
+# starts fine without them and /bifactor + /mokken return a clean
+# 'package not installed' message instead of crashing at boot.
 
 
 # =====================================================================
