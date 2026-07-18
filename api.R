@@ -1,5 +1,5 @@
 #
-# IRT Analysis API for DLTPT  --  v2.1
+# IRT Analysis API for DLTPT  --  v2.3
 # =====================================================================
 # One TAM/plumber service, two engines:
 #
@@ -29,6 +29,8 @@
 library(plumber)
 library(jsonlite)
 library(TAM)
+library(mirt)     # bifactor (v2.2)
+library(mokken)   # nonparametric scaling (v2.2)
 
 
 # =====================================================================
@@ -92,6 +94,13 @@ fit_rasch <- function(resp) {
 fit_pcm <- function(resp) {
   tryCatch(
     suppressMessages(tam.mml(resp, irtmodel = "PCM", verbose = FALSE)),
+    error = function(e) structure(list(error = e$message), class = "tam_error")
+  )
+}
+
+fit_gpcm <- function(resp) {
+  tryCatch(
+    suppressMessages(tam.mml.2pl(resp, irtmodel = "GPCM", verbose = FALSE)),
     error = function(e) structure(list(error = e$message), class = "tam_error")
   )
 }
@@ -164,14 +173,22 @@ response_diagnostics <- function(resp) {
 
 # Decide model. Explicit request overrides the N gate but still obeys the floor.
 select_model <- function(n_cal, requested, cfg) {
+  twopl_min <- cfg$twopl_min_n %||% 200
   if (!is.null(requested) && nzchar(requested)) {
     m <- tolower(requested)
-    if (m %in% c("rasch", "1pl")) return(list(model = "rasch", selection = "explicit"))
-    if (m %in% c("2pl"))          return(list(model = "2pl",   selection = "explicit"))
-    return(list(model = NA, selection = "invalid"))
+    if (m %in% c("rasch", "1pl"))
+      return(list(model = "rasch", selection = "explicit", warning = NULL))
+    if (m %in% c("2pl")) {
+      warn <- if (n_cal < twopl_min)
+        sprintf(paste("2PL requested with N=%d < recommended %d; slope estimates",
+                      "may be unstable. Rasch is advised at this sample size."),
+                n_cal, twopl_min) else NULL
+      return(list(model = "2pl", selection = "explicit", warning = warn))
+    }
+    return(list(model = NA, selection = "invalid", warning = NULL))
   }
-  if (n_cal >= cfg$twopl_min_n) list(model = "2pl",   selection = "auto")
-  else                         list(model = "rasch", selection = "auto")
+  if (n_cal >= twopl_min) list(model = "2pl",   selection = "auto", warning = NULL)
+  else                    list(model = "rasch", selection = "auto", warning = NULL)
 }
 
 build_item_flags <- function(resp, a, b, mod, cfg) {
@@ -472,6 +489,7 @@ run_analysis <- function(body) {
       type             = if (sel$model == "2pl") "2PL" else "Rasch",
       package          = "TAM",
       selection        = sel$selection,
+      sample_size_warning = sel$warning,
       n_used_for_calib = n_cal,
       eap_reliability  = eap_rel,           eap_text      = text_eap(eap_rel),
       wle_reliability  = wle_rel,           wle_text      = text_wle_rel(wle_rel),
@@ -554,9 +572,12 @@ extract_items_generic <- function(mod, method, item_names) {
 # Run one method -> COMMON OUTPUT CONTRACT (or {method, error}).
 # {method, scope, model, n_used, person_keys_used, theta, se,
 #  reliability:{eap,wle}, items, item_order}
-run_method <- function(method, item_m, exercise_m, exercise_max, person_keys, cfg) {
+run_method <- function(method, item_m, exercise_m, exercise_max, person_keys, cfg,
+                       item_max = NULL) {
   if (method %in% c("item_2pl", "item_rasch")) {
     resp <- item_m; max_scores <- NULL; scope <- "item"
+  } else if (method %in% c("item_pcm", "item_gpcm")) {
+    resp <- item_m; max_scores <- item_max; scope <- "item"
   } else if (method == "exercise_pcm") {
     resp <- exercise_m; max_scores <- exercise_max; scope <- "exercise"
   } else {
@@ -578,6 +599,8 @@ run_method <- function(method, item_m, exercise_m, exercise_max, person_keys, cf
   mod <- switch(method,
     item_2pl     = fit_2pl(resp_c),
     item_rasch   = fit_rasch(resp_c),
+    item_pcm     = fit_pcm(resp_c),
+    item_gpcm    = fit_gpcm(resp_c),
     exercise_pcm = fit_pcm(resp_c))
   if (inherits(mod, "tam_error"))
     return(list(method = method, error = paste("fit failed:", mod$error)))
@@ -593,7 +616,8 @@ run_method <- function(method, item_m, exercise_m, exercise_max, person_keys, cf
 
   list(
     method = method, scope = scope,
-    model  = switch(method, item_2pl = "2PL", item_rasch = "Rasch", exercise_pcm = "PCM"),
+    model  = switch(method, item_2pl = "2PL", item_rasch = "Rasch",
+                    item_pcm = "PCM (item)", item_gpcm = "GPCM (item)", exercise_pcm = "PCM"),
     n_used = nrow(resp_c),
     person_keys_used = pk_c,
     theta = as.list(theta), se = as.list(se),
@@ -684,12 +708,13 @@ run_form_analysis <- function(body) {
   person_keys <- as.character(body$person_keys)
 
   item_m       <- if (!is.null(body$item))     block_to_matrix(body$item)          else NULL
+  item_max     <- if (!is.null(body$item))     as.numeric(body$item$max_scores)    else NULL
   exercise_m   <- if (!is.null(body$exercise)) block_to_matrix(body$exercise)      else NULL
   exercise_max <- if (!is.null(body$exercise)) as.numeric(body$exercise$max_scores) else NULL
   # body$item$exercise_id reserved for bifactor (later method); unused here.
 
   results <- lapply(methods, function(m)
-    run_method(m, item_m, exercise_m, exercise_max, person_keys, cfg))
+    run_method(m, item_m, exercise_m, exercise_max, person_keys, cfg, item_max))
 
   comparison <- layer_c(results, cfg)
 
@@ -703,10 +728,12 @@ run_form_analysis <- function(body) {
   fits_l <- Filter(function(r) !is.null(r$.mod), results)
   fits   <- setNames(lapply(fits_l, function(r) r$.mod),
                      vapply(fits_l, function(r) r$method, character(1)))
-  mc <- if (length(fits)) model_comparison(fits) else NULL
+  scopes <- setNames(as.list(vapply(fits_l, function(r) r$scope, character(1))),
+                     vapply(fits_l, function(r) r$method, character(1)))
+  mc <- if (length(fits)) model_comparison(fits, scopes) else NULL
 
   tcc <- NULL
-  if (length(item_fit)) {
+  if (length(item_fit) && item_fit[[1]]$method %in% c("item_2pl", "item_rasch")) {
     p  <- extract_item_params(item_fit[[1]]$.mod,
             if (item_fit[[1]]$method == "item_2pl") "2pl" else "rasch")
     gr <- seq(-4, 4, 0.05)
@@ -734,6 +761,145 @@ run_form_analysis <- function(body) {
   )
 }
 
+
+
+# =====================================================================
+# EXTENDED MODELS (v2.2): bifactor, Mokken, Mantel-Haenszel DIF
+# =====================================================================
+
+bifactor_report <- function(resp, group, item_names = colnames(resp)) {
+  if (!requireNamespace("mirt", quietly = TRUE))
+    return(list(available = FALSE, note = "mirt not installed"))
+  X <- as.matrix(resp); X <- X[stats::complete.cases(X), , drop = FALSE]
+  if (nrow(X) < 20 || ncol(X) < 4)
+    return(list(available = FALSE, note = "need >=20 complete cases and >=4 items"))
+  grp      <- as.character(group)
+  specific <- as.integer(factor(grp, levels = unique(grp)))   # 1..nPassage
+  tryCatch({
+    bf  <- mirt::bfactor(X, model = specific, verbose = FALSE,
+                         technical = list(NCYCLES = 800))
+    uni <- mirt::mirt(X, 1, itemtype = "Rasch", verbose = FALSE)
+    sig  <- summary(bf, verbose = FALSE)
+    load <- sig$rotF %||% sig$F
+    g_load <- as.numeric(load[, 1]); names(g_load) <- item_names
+    spec_by_pass <- tapply(seq_along(item_names), grp, function(ix) {
+      cols <- 2:ncol(load); v <- load[ix, cols]; mean(abs(v[v != 0]), na.rm = TRUE)
+    })
+    ic_bf <- mirt::anova(uni, bf)                # LRT + AIC/BIC on same items
+    list(
+      available = TRUE, n_passages = length(unique(grp)),
+      general_loadings = lapply(seq_along(item_names), function(i)
+        list(item = item_names[i], general = round(g_load[i], 3))),
+      mean_specific_loading_by_passage = round(spec_by_pass, 3),
+      empirical_reliability = tryCatch(round(as.numeric(
+        mirt::empirical_rxx(mirt::fscores(bf, method = "EAP",
+                                          full.scores.SE = TRUE))[1]), 3),
+        error = function(e) NA_real_),
+      fit_vs_unidim = list(
+        bifactor_BIC     = round(ic_bf$BIC[2], 1),
+        unidim_BIC       = round(ic_bf$BIC[1], 1),
+        prefers_bifactor = isTRUE(ic_bf$BIC[2] < ic_bf$BIC[1]),
+        lrt_p            = tryCatch(round(ic_bf$p[2], 4), error = function(e) NA_real_)),
+      interpretation = paste(
+        "Bifactor keeps gap-level items while a per-passage specific factor",
+        "absorbs within-passage dependence. BIC prefers the simpler model when",
+        "the specific factors do not earn their parameters (common at small N);",
+        "a significant LRT with BIC still favouring unidim means dependence is",
+        "real but modest. Compare with the PCM (exercise-scope) result."))
+  }, error = function(e) list(available = FALSE,
+                              note = paste("bifactor failed:", conditionMessage(e))))
+}
+
+
+mokken_report <- function(resp, item_names = colnames(resp)) {
+  if (!requireNamespace("mokken", quietly = TRUE))
+    return(list(available = FALSE, note = "mokken not installed"))
+  X <- as.matrix(resp); X <- X[stats::complete.cases(X), , drop = FALSE]
+  if (nrow(X) < 20 || ncol(X) < 3)
+    return(list(available = FALSE, note = "need >=20 complete cases and >=3 items"))
+  tryCatch({
+    Hs <- NULL
+    utils::capture.output(Hs <- mokken::coefH(X, se = TRUE))   # silence side-effect print
+    Hscale <- suppressWarnings(as.numeric(Hs$H[[1]]))
+    Hse    <- suppressWarnings(as.numeric(Hs$H[[2]]))
+    Hi_df  <- as.data.frame(Hs$Hi, stringsAsFactors = FALSE)
+    Hitem  <- suppressWarnings(as.numeric(Hi_df[[1]]))
+    aisp   <- tryCatch(as.integer(mokken::aisp(X)),
+                       error = function(e) rep(NA_integer_, ncol(X)))
+    items <- lapply(seq_along(item_names), function(i)
+      list(item = item_names[i], H = round(Hitem[i], 3),
+           scale = if (length(aisp) >= i) aisp[i] else NA_integer_))
+    interp <- if (is.na(Hscale)) "Scale H not estimable." else
+      if (Hscale < .3) "Scale H < 0.30: items do not form a Mokken scale (weak scalability)." else
+      if (Hscale < .4) "Scale H 0.30-0.40: weak but usable scale." else
+      if (Hscale < .5) "Scale H 0.40-0.50: medium scale." else
+                       "Scale H >= 0.50: strong scale."
+    list(available = TRUE,
+         scale_H = round(Hscale, 3),
+         scale_H_se = if (!is.na(Hse)) round(Hse, 3) else NA_real_,
+         n_scales_aisp = length(unique(stats::na.omit(aisp))),
+         items = items,
+         rule_of_thumb = "H<0.3 not scalable; 0.3-0.4 weak; 0.4-0.5 medium; >=0.5 strong.",
+         interpretation = interp)
+  }, error = function(e) list(available = FALSE,
+                              note = paste("mokken failed:", conditionMessage(e))))
+}
+
+
+classify_ets_dif <- function(ddif, p, stable) {
+  if (!isTRUE(stable) || is.na(ddif) || is.na(p)) return("unstable")
+  ad <- abs(ddif); sig <- p < 0.05
+  if (ad >= 1.5 && sig) "C" else if (ad >= 1.0 && sig) "B" else "A"
+}
+
+
+mh_dif_report <- function(resp, group_vec, n_strata = 4) {
+  X <- as.matrix(resp); g <- as.factor(group_vec)
+  if (nlevels(g) != 2) return(list(available = FALSE, note = "MH DIF needs exactly 2 groups"))
+  ref_lab <- levels(g)[1]; foc_lab <- levels(g)[2]
+  total <- rowSums(X, na.rm = TRUE); k <- ncol(X)
+
+  per_item <- lapply(seq_len(k), function(j) {
+    rest <- total - X[, j]
+    qs <- unique(stats::quantile(rest, probs = seq(0, 1, length.out = n_strata + 1),
+                                 na.rm = TRUE))
+    strat <- if (length(qs) >= 3) cut(rest, breaks = qs, include.lowest = TRUE)
+             else factor(rest)
+    tab <- table(factor(X[, j], levels = c(1, 0)), g, strat)
+    keep <- apply(tab, 3, function(s) all(colSums(s) > 0) && sum(s) >= 2)
+    tab  <- tab[, , keep, drop = FALSE]
+    if (dim(tab)[3] < 1) return(list(item = colnames(X)[j], available = FALSE))
+    mh <- tryCatch(stats::mantelhaen.test(tab, correct = TRUE), error = function(e) NULL)
+    if (is.null(mh) || is.null(mh$estimate)) return(list(item = colnames(X)[j], available = FALSE))
+    orr    <- as.numeric(mh$estimate)
+    stable <- is.finite(orr) && orr > 0
+    ddif   <- if (stable) -2.35 * log(orr) else NA_real_
+    list(item = colnames(X)[j], available = TRUE,
+         MH_OR = if (is.finite(orr)) round(orr, 3) else NA_real_,
+         MH_chisq = round(as.numeric(mh$statistic), 3),
+         p = round(mh$p.value, 4),
+         MH_D_DIF = if (stable) round(ddif, 3) else NA_real_,
+         ETS_class = classify_ets_dif(ddif, mh$p.value, stable))
+  })
+  ok <- Filter(function(x) isTRUE(x$available), per_item)
+  if (!length(ok)) return(list(available = FALSE, note = "no items had usable strata"))
+  tab <- do.call(rbind, lapply(ok, function(x) data.frame(
+    Item = x$item, MH_OR = x$MH_OR, MH_chisq = x$MH_chisq, p = x$p,
+    MH_D_DIF = x$MH_D_DIF, ETS = x$ETS_class, stringsAsFactors = FALSE)))
+  tab <- tab[order(-abs(replace(tab$MH_D_DIF, is.na(tab$MH_D_DIF), 0))), ]
+  list(
+    available = TRUE, groups = c(ref_lab, foc_lab),
+    method = sprintf("Mantel-Haenszel, rest-score matched in %d quantile strata, significance-gated ETS D-DIF (A/B/C)", n_strata),
+    n_items_tested = nrow(tab),
+    n_unstable = sum(tab$ETS == "unstable"),
+    n_BC = sum(tab$ETS %in% c("B", "C"), na.rm = TRUE),
+    n_C  = sum(tab$ETS == "C", na.rm = TRUE),
+    items = tab,
+    note = paste("ETS: |D|<1 negligible (A); 1.0-1.5 moderate (B) and >=1.5 large (C),",
+                 "each requiring MH p<.05; 'unstable' = degenerate odds ratio (too few",
+                 "cases). Small per-group N reduces power; pair with the Rasch-contrast",
+                 "dif_report() and prefer testlet-level DIF under within-passage dependence."))
+}
 
 # =====================================================================
 # ROUTES
@@ -778,11 +944,61 @@ function(req, res) {
   )
 }
 
+#* Bifactor / testlet model (gap items + per-passage specific factors)
+#* @post /bifactor
+#* @serializer json
+function(req, res) {
+  body <- parse_body(req)
+  if (is.null(body) || is.null(body$item)) {
+    res$status <- 400; return(list(error = "Need item block with exercise_id."))
+  }
+  tryCatch({
+    item_m <- block_to_matrix(body$item)
+    keep   <- clean_matrix(item_m, NULL)
+    bifactor_report(item_m[keep, , drop = FALSE],
+                    body$item$exercise_id, colnames(item_m))
+  }, error = function(e) { res$status <- 500
+    list(error = paste("bifactor failed:", conditionMessage(e))) })
+}
+
+#* Mokken nonparametric scalability (Loevinger H, AISP)
+#* @post /mokken
+#* @serializer json
+function(req, res) {
+  body <- parse_body(req)
+  if (is.null(body) || is.null(body$item)) {
+    res$status <- 400; return(list(error = "Need item block."))
+  }
+  tryCatch({
+    item_m <- block_to_matrix(body$item)
+    keep   <- clean_matrix(item_m, NULL)
+    mokken_report(item_m[keep, , drop = FALSE], colnames(item_m))
+  }, error = function(e) { res$status <- 500
+    list(error = paste("mokken failed:", conditionMessage(e))) })
+}
+
+#* Mantel-Haenszel DIF across a two-level grouping variable
+#* @post /dif_mh
+#* @serializer json
+function(req, res) {
+  body <- parse_body(req)
+  if (is.null(body) || is.null(body$item) || is.null(body$group)) {
+    res$status <- 400
+    return(list(error = "Need item block and a group vector (length = n persons)."))
+  }
+  tryCatch({
+    item_m <- block_to_matrix(body$item)
+    cfg    <- merge_config(DEFAULTS, body$config)
+    mh_dif_report(item_m, body$group, n_strata = cfg$mh_strata %||% 4)
+  }, error = function(e) { res$status <- 500
+    list(error = paste("MH DIF failed:", conditionMessage(e))) })
+}
+
 #* Health check
 #* @get /
 function() {
-  list(status = "ok", service = "DLTPT IRT", version = "2.0",
-       engines = c("irt", "form"))
+  list(status = "ok", service = "DLTPT IRT", version = "2.3",
+       engines = c("irt", "form", "bifactor", "mokken", "dif_mh"))
 }
 
 
@@ -897,21 +1113,38 @@ ld_by_group <- function(item_mod, item_names, group,
 # preferable. At C-Test-typical N the 2PL's per-item discriminations
 # frequently fail to earn their parameters; BIC is the honest arbiter.
 # Returns one row per successfully-fitted method.
-model_comparison <- function(fits) {
+model_comparison <- function(fits, scopes = NULL) {
   rows <- lapply(names(fits), function(nm) {
     m  <- fits[[nm]]
     ic <- tryCatch(m$ic, error = function(e) NULL)
     data.frame(
       method = nm,
-      npars  = tryCatch(ic$Npars,               error = function(e) NA_real_),
+      scope  = if (!is.null(scopes)) scopes[[nm]] %||% NA_character_ else NA_character_,
+      npars  = tryCatch(ic$Npars, error = function(e) NA_real_),
+      n_obs  = tryCatch(ic$n,     error = function(e) NA_real_),
       loglik = tryCatch(round(as.numeric(logLik(m)), 1), error = function(e) NA_real_),
-      AIC    = tryCatch(round(ic$AIC, 1),        error = function(e) NA_real_),
-      BIC    = tryCatch(round(ic$BIC, 1),        error = function(e) NA_real_),
+      AIC    = tryCatch(round(ic$AIC, 1), error = function(e) NA_real_),
+      BIC    = tryCatch(round(ic$BIC, 1), error = function(e) NA_real_),
       stringsAsFactors = FALSE)
   })
   tab <- do.call(rbind, rows)
-  ok  <- tab[!is.na(tab$BIC), , drop = FALSE]
-  if (nrow(ok) > 0) tab$preferred_by_BIC <- tab$method == ok$method[which.min(ok$BIC)]
+
+  tab$comparable       <- TRUE
+  tab$preferred_by_BIC <- FALSE
+  if (!is.null(scopes) && length(unique(stats::na.omit(tab$scope))) > 1) {
+    sc_counts  <- sort(table(tab$scope), decreasing = TRUE)
+    main_scope <- names(sc_counts)[1]           # largest same-scope set
+    tab$comparable <- tab$scope == main_scope
+  }
+  cand <- tab[tab$comparable & !is.na(tab$BIC), , drop = FALSE]
+  if (nrow(cand) > 0)
+    tab$preferred_by_BIC <- tab$method == cand$method[which.min(cand$BIC)]
+
+  attr(tab, "note") <- paste(
+    "AIC/BIC compared only within a single response scope (same observations",
+    "and likelihood scale). Cross-scope rows (e.g. exercise-level PCM vs",
+    "item-level 2PL/Rasch) are shown for reference, marked comparable=FALSE,",
+    "and excluded from the preferred-model choice.")
   tab
 }
 
